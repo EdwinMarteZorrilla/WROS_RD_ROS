@@ -120,13 +120,26 @@ class FireFighterRobot:
 
 
     def fire_fighting_state(self):
-        print("[STATE] FIRE_FIGHTING: Activando bomba de agua...")
-        start_time = time.time()
-        while time.time() - start_time < 10:
-            print("Bomba ON")
-            time.sleep(10)
-        print("Fuego apagado. Bomba OFF")
-        self.state = "DONE"
+         print("[STATE] FIRE_FIGHTING: Activando bomba de agua y servos simult  neamente...")
+
+        try:
+            # Lanzar la bomba y el servo en paralelo
+            pump_process = subprocess.Popen(["python3", FIRE_FIGHT_SCRIPT])
+            servo_process = subprocess.Popen(["python3", SERVO_SCRIPT])
+
+            print("[ACTION] Bomba y servo iniciados al mismo tiempo.")
+
+            # Esperar un tiempo mientras trabajan (puedes ajustar este valor)
+            time.sleep(5)
+
+            # Finalizar ambos procesos
+            pump_process.terminate()
+            servo_process.terminate()
+
+            print("[ACTION] Operaci  n de extinci  n completada.")
+
+        except Exception as e:
+            print(f"[ERROR] Error ejecutando scripts simult  neos: {e}")
 
     def done_state(self):
         print("[STATE] DONE: Misión completa. Regresando a IDLE.")
