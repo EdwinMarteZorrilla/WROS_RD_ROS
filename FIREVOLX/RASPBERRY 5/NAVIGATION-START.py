@@ -9,6 +9,8 @@ import numpy as np
 from collections import deque
 import matplotlib.pyplot as plt
 import math
+import sys #nuevo
+
 
 # ---------------- CONFIG ----.------------
 GRID_SIZE = 0.2  # meters per grid cell
@@ -249,7 +251,23 @@ def main():
     rclpy.spin_once(odom_reader)
 
   # ---------------- Automatic Goal Placement ----------------
-    Zone_ID = 1  # <-- Set this dynamically or manually
+    #Zone_ID = 1  # <-- Set this dynamically or manually
+    # Get Zone_ID from command-line argument if provided
+   # Get RPI_ID from command-line argument (e.g., "RPI_1" or "RPI_2")
+    if len(sys.argv) > 1:
+        rpi_id = sys.argv[1].strip().upper()
+    else:
+        rpi_id = "RPI_1"  # default
+
+    # Map RPI_ID strings to Zone_ID numbers
+    rpi_to_zone = {
+        "RPI_1": 1,
+        "RPI_2": 2
+    }
+    
+    Zone_ID = rpi_to_zone.get(rpi_id, 1)  # default to Zone 1 if unknown
+    print(f"[NAVIGATION] Received {rpi_id}, setting Zone_ID = {Zone_ID}")
+
 
     # Define XgoaXl coordinates based on Zone_ID
     zone_goals = {

@@ -1,35 +1,22 @@
-#/usr/bin/env python3
+#!/usr/bin/env python3
 import time
 import subprocess
 import json
-import threading
 import paho.mqtt.client as mqtt
+import os
 
-# -X----------------------------
-# CONFIGURACI ^sN MQTT
-# -----------------------------
-BROKERS = ["192.168.149.171", "192.168.149.148"]
+BROKERS = ["192.168.149.171", "192.168.149.1"]
 BROKER_PORT = 1883
 TOPIC_FIRE = "alerta/fuego"
+NAVIGATION_SCRIPT = "/programs/navigation.py"
+POSE_FILE = "/tmp/robot_pose.json"
 
-# -----------------------------
-#x Rutas de scripts
-# -----------------------------
-NAVIGATION_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/NAVEGATION" # Script de Navegacion 
-FIRE_FIGHT_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/TEST-MQTT"  # Script de bomba MQTT
-SERVO_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/SERVO-TEST"       # Nodo ROS2 del servo
-
-# -----------------------------
-# FireFighterRobot: M  quina de estado
-# -----------------------------
 class FireFighterRobot:
     def __init__(self):
         self.state = "IDLE"
         self.fire_detected = False
         self.last_rpi = None
-        print(" ^= ^v Robot iniciado. Estado actual: IDLE")
-
-        # Conectar a todos los brokers MQTT
+        print("Robot iniciado. Estado: IDLE")
         self.mqtt_clients = []
         for ip in BROKERS:
             client = mqtt.Client()
@@ -43,72 +30,97 @@ class FireFighterRobot:
             client.loop_start()
             self.mqtt_clients.append(client)
 
-    # -----------------------------
-    # MQTT Callbacksss
-    # -----------------------------
     def on_connect(self, client, userdata, flags, rc):
-        print(f"[MQTT] Conectado. Subscrito al t  pico: {TOPIC_FIRE}")
         client.subscribe(TOPIC_FIRE)
+        print(f"[MQTT] Subscrito a {TOPIC_FIRE}")
 
     def on_message(self, client, userdata, msg):
         try:
             data = json.loads(msg.payload.decode())
             label = data.get("label")
             rpi_id = data.get("rpi_id")
-
-            if label in ["fire", "cigar", "fireball"]:
-                print(f"[MQTT] ^=^z Fuego detectado por {rpi_id}: {label}")
+            if label in ["fire","cigar","fireball"]:
+                print(f"[ALERTA] Fuego detectado por {rpi_id}")
                 self.fire_detected = True
                 self.last_rpi = rpi_id
-            else:
-                print(f"[MQTT] Mensaje ignorado de {rpi_id}: {label}")
         except Exception as e:
             print("[MQTT] Error procesando mensaje:", e)
 
-    # -----------------------------
-    # L  gica de estados
-    # -----------------------------
     def run(self):
         while True:
-            if self.state == "IDLE" and self.fire_detected:
-                print("[STATE] Se  al de fuego recibida. Cambiando a NAVIGATION.")
-                self.state = "NAVIGATION"
-
+            if self.state == "IDLE":
+                self.idle_state()
             elif self.state == "NAVIGATION":
                 self.navigation_state()
-                self.state = "SEARCH"
-
-            elif self.state == "SEARCH":
-                self.search_state()
-                self.state = "FIRE_FIGHTING"
-
             elif self.state == "FIRE_FIGHTING":
                 self.fire_fighting_state()
-                self.state = "DONE"
-
             elif self.state == "DONE":
                 self.done_state()
-                self.state = "IDLE"
+                break
+            time.sleep(0.1)
 
-            time.sleep(0.2)
+    def idle_state(self):
+        print("[STATE] IDLE esperando alerta...")
+        if self.fire_detected:
+            self.state = "NAVIGATION"
 
-    # -----------------------------
-    # ESTADOS INDIVIDUALES
-    # -----------------------------
     def navigation_state(self):
-        print(f"[STATE] NAVIGATION: Ejecutando navegaci  n por {self.last_rpi}...")
-        try:
-            subprocess.run(["python3", NAVIGATION_SCRIPT], check=True)
-        except Exception as e:
-            print(f"Error ejecutando navegaci  n: {e}")
+        print(f"[STATE] NAVIGATION ejecutando navegación hacia {self.last_rpi}")
 
-    def search_state(self):
-        print("[STATE] SEARCH: Escaneando   rea...")
-        time.sleep(2)
-        print("Fuego confirmado visualmente.")
+        # Load last known robot position (if available)
+        if os.path.exists(POSE_FILE):
+            with open(POSE_FILE, "r") as f:
+                pose = json.load(f)
+            print(f"[NAVIGATION] Usando última posición: {pose}")
+            # Convert odom position (meters) to grid indices
+            start = (int(round(pose["y"] / 0.2)), int(round(pose["x"] / 0.2)))
+        else:
+            print("[NAVIGATION] Sin posición previa -> usando (0,0) como inicio")
+            start = (0, 0)
+
+        # Define goal coordinates based on RPi that triggered alert
+        if self.last_rpi == "RPI_1":
+            goal = (4, 0)
+        elif self.last_rpi == "RPI_2":
+            goal = (2, 2)
+        else:
+            goal = (5, 5)
+
+        print(f"[NAVIGATION] Navegando de {start} hacia {goal}")
+
+        try:
+            subprocess.run([
+                "python3", NAVIGATION_SCRIPT,
+                "--start_row", str(start[0]),
+                "--start_col", str(start[1]),
+                "--goal_row", str(goal[0]),
+                "--goal_col", str(goal[1])
+            ], check=True)
+
+            # After navigation, read pose
+            if os.path.exists(POSE_FILE):
+                with open(POSE_FILE, "r") as f:
+                    pose = json.load(f)
+                print(f"[NAVIGATION] Posición final: {pose}")
+
+            # Go back home (origin)
+            subprocess.run([
+                "python3", NAVIGATION_SCRIPT,
+                "--start_row", str(goal[0]),
+                "--start_col", str(goal[1]),
+                "--goal_row", "0",
+                "--goal_col", "0"
+            ], check=True)
+
+            self.state = "FIRE_FIGHTING"
+
+        except Exception as e:
+            print(f"[STATE] Error ejecutando navegación: {e}")
+            self.state = "DONE"
+
 
     def fire_fighting_state(self):
-        print("[STATE] FIRE_FIGHTING: Activando bomba de agua y servos simult  neamente...")
+         print("[STATE] FIRE_FIGHTING: Activando bomba de agua y servos simult  neamente...")
 
         try:
             # Lanzar la bomba y el servo en paralelo
@@ -130,25 +142,11 @@ class FireFighterRobot:
             print(f"[ERROR] Error ejecutando scripts simult  neos: {e}")
 
     def done_state(self):
-        print("[STATE] DONE: Operaci  n completada. Regresando a IDLE.")
+        print("[STATE] DONE: Misión completa. Regresando a IDLE.")
         self.fire_detected = False
         self.last_rpi = None
+        self.state = "IDLE"
 
-
-# -----------------------------
-# Main
-# -----------------------------
 if __name__ == "__main__":
     robot = FireFighterRobot()
     robot.run()
-
-
-
-
-
-
-
-
-
-
-
