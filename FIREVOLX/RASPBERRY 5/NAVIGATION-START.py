@@ -1,4 +1,3 @@
-  GNU nano 6.2                                                                                                                                                                                                                                                                                                                                                                                                                                                                     NAVEGATION                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
@@ -11,7 +10,7 @@ from collections import deque
 import matplotlib.pyplot as plt
 import math
 
-# ---------------- CONFIG ----------------
+# ---------------- CONFIG ----.------------
 GRID_SIZE = 0.2  # meters per grid cell
 
 # ---------------- IMU Reader ----------------
