@@ -1,0 +1,107 @@
+import rclpy
+from rclpy.node import Node
+from ros_robot_controller_msgs.msg import SetPWMServoState, PWMServoState
+from time import time, sleep
+
+class SprayServoController(Node):
+    def __init__(self):
+        super().__init__('spray_servo_controller')
+
+        # --- xParameters ---
+        self.declare_parameter('servo_id', 3)
+        self.declare_parameter('angle_150', 900)    # servo position for ~150 degrees
+        self.declare_parameter('angle_170', 750)    # servo position for ~170 degrees
+        self.declare_parameter('neutral', 850)      # Neutral/stop position
+        self.declare_parameter('motion_duration', 5.0)  # Total duration for the cyclic motion
+        self.declare_parameter('smooth_step', 4)        # Step size for smooth motion
+        self.declare_parameter('timer_period', 0.01)    # Update period (seconds)
+
+        # --- Load parameters ---
+        self.servo_id = self.get_parameter('servo_id').value
+        self.angle_150 = self.get_parameter('angle_150').value
+        self.angle_170 = self.get_parameter('angle_170').value
+        self.neutral = self.get_parameter('neutral').value
+        self.motion_duration = self.get_parameter('motion_duration').value
+        self.smooth_step = self.get_parameter('smooth_step').value
+        self.timer_period = self.get_parameter('timer_period').value
+
+        # --- Publisher ---
+        self.publisher = self.create_publisher(SetPWMServoState,
+                                               '/ros_robot_controller/pwm_servo/set_state', 10)
+
+        # --- Control state ---
+        self.current_position = float(self.neutral)
+        self.target_position = float(self.angle_170)
+        self.is_moving_to_150 = False
+        self.start_time = time()
+
+        # --- Timer ---
+        self.timer = self.create_timer(self.timer_period, self.timer_callback)
+
+        self.get_logger().info("✅ Servo smooth motion started between 150° and 170°.")
+
+    def set_servo_position(self, position):
+        """Publishes the command to set the servo's position."""
+        msg = SetPWMServoState()
+        servo_state = PWMServoState()
+        servo_state.id = [self.servo_id]
+        servo_state.position = [int(round(position))]
+        servo_state.offset = [0]
+        msg.state.append(servo_state)
+        self.publisher.publish(msg)
+
+    def timer_callback(self):
+        elapsed = time() - self.start_time
+
+        # If time is up → move to neutral
+        if elapsed > self.motion_duration:
+            self.get_logger().info("⏹ Motion complete. Moving to neutral...")
+            self.target_position = float(self.neutral)
+            if abs(self.current_position - self.target_position) <= self.smooth_step:
+                self.set_servo_position(self.neutral)
+                self.timer.cancel()
+                self.get_logger().info("🧹 Servo motion timer cancelled.")
+                return
+        else:
+            self.target_position = float(self.angle_150 if self.is_moving_to_150 else self.angle_170)
+
+        # Step movement toward target
+        difference = self.target_position - self.current_position
+        if abs(difference) > self.smooth_step:
+            step = self.smooth_step if difference > 0 else -self.smooth_step
+            self.current_position += step
+        else:
+            self.current_position = self.target_position
+            if elapsed <= self.motion_duration:
+                self.is_moving_to_150 = not self.is_moving_to_150
+                self.get_logger().info(
+                    f"🎯 Target {int(round(self.target_position))} reached. Switching to "
+                    f"{'150°' if self.is_moving_to_150 else '170°'}."
+                )
+
+        self.set_servo_position(self.current_position)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SprayServoController()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("⚠️ Interrupted. Moving to neutral smoothly...")
+        node.target_position = float(node.neutral)
+
+        while abs(node.current_position - node.neutral) > node.smooth_step:
+            step = node.smooth_step if node.neutral > node.current_position else -node.smooth_step
+            node.current_position += step
+            node.set_servo_position(node.current_position)
+            sleep(node.timer_period)
+
+        node.set_servo_position(node.neutral)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

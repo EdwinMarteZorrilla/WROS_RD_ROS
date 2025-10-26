@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+import time
+from rrclite_sdk import Board  # reemplaza 'rrclite_sdk' con el nombre real del archivo SDK si es distinto
+
+def main():
+    # Inicializar la placa en el puerto correcto
+    board = Board(device="/dev/ttyACM0")  # <-- actualizado
+    board.enable_reception(True)  # Comienza a recibir feedback de la placa
+
+    # Parpadeo del LED: 0.2s encendido, 0.2s apagado, repetir 3 veces
+    board.set_led(on_time=0.2, off_time=0.2, repeat=3, led_id=1)
+
+    # Beep del buzzer: 1500Hz, 0.3s encendido, 0.1s apagado, repetir 2 veces
+    board.set_buzzer(freq=1500, on_time=0.3, off_time=0.1, repeat=2)
+
+    print("✅ Comandos enviados: parpadeo de LED y beep del buzzer.")
+
+    # Mantener el script vivo para asegurar que se envíen los comandos
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("⏹ Saliendo del programa...")
+
+if __name__ == "__main__":
+    main()

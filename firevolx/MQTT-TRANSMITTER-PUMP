@@ -1,0 +1,39 @@
+import time
+import paho.mqtt.client as mqtt
+
+# -x---X-------------------------
+# CONXFIGURACIÓN MQTT
+# -----------------------------
+BROKER_IP = "127.0.0.1"  # Cambia a la IP de tu Pi si es necesario
+BROKER_PORT = 1883
+TOPIC = "PUMP-TESTX"
+
+# Duración opcional para mandar "off" después de cierto tiempo (en segundos)
+OFF_DELAY = 4  # Cambia este valor según lo que quieras esperar
+
+# -----------------------------
+# CONEXIÓN MQTT
+# -----------------------------
+client = mqtt.Client()
+client.connect(BROKER_IP, BROKER_PORT, 60)
+client.loop_start()
+
+try:
+    # Enviar "on" una sola vez
+    client.publish(TOPIC, "on")
+    print("Published: on")
+
+    # Esperar el tiempo configurado antes de mandar "off"
+    time.sleep(OFF_DELAY)
+
+    # Enviar "off" una sola vez
+    client.publish(TOPIC, "off")
+    print("Published: off")
+
+except KeyboardInterrupt:
+    print("Stopping program...")
+
+finally:
+    client.loop_stop()
+    client.disconnect()
+
