@@ -299,6 +299,10 @@ def main():
         rclpy.spin_once(odom_reader)
         time.sleep(0.02)
 
+    # Determine if first move is forward
+    first_move = path[0] if len(path) > 0 else (0, 0)
+    dr, dc = first_move
+
     current_fused = odom_reader.fused_yaw
     raw_offset = target_map_yaw - current_fused
     odom_reader.map_yaw_offset = math.atan2(math.sin(raw_offset), math.cos(raw_offset))
@@ -306,9 +310,13 @@ def main():
     print(f"Aligning: current fused_yaw={current_fused:.3f}, target={target_map_yaw:.3f}, "
           f"offset={odom_reader.map_yaw_offset:.3f}")
 
-    print("Rotating robot to align forward with map direction...")
-    node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.02, max_speed=0.4)
-    print("Rotation complete. Robot is now facing map forward.")
+    # If first move is forward (e.g., dr < 0 means "south" in map coordinates)
+    if dr != 0 and dc == 0:
+        print("First move is forward — skipping initial rotation.")
+    else:
+        print("Rotating robot to align forward with map direction...")
+        node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.02, max_speed=0.4)
+        print("Rotation complete. Robot is now aligned.")
 
     follow_path(node, path, odom_sub=odom_reader, imu_sub=imu_reader,
                 maze=maze, start=start, goal=goal)
