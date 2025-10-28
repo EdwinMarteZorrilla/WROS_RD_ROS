@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import time, subprocess, json, paho.mqtt.client as mqtt
+import time, subprocess, json, paho.mqtt.client as mqtt 
 
 # ---------------- CONFIGURACIÓN ----------------
 BROKERS = ["192.168.149.171", "192.168.149.148"]
