@@ -12,7 +12,7 @@ import math
 
 # ---------------- CONFIG ----------------
 GRID_SIZE = 0.50  # meters per grid cell
-
+GRID_SIZE = 0.2
 # ---------------- IMU Reader ----------------
 class IMUReader(Node):
     """Reads IMU yaw from /imu"""
@@ -258,10 +258,10 @@ def main():
     maze_layout = [
         ["R", "1", "0", "0", "0", "0"],
         ["0", "1", "0", "1", "1", "0"],
-        ["0", "0", "0", "1", "0", "0"],
+        ["0", "0", "G", "1", "0", "0"],
         ["0", "1", "1", "1", "0", "1"],
         ["0", "0", "1", "0", "0", "0"],
-        ["G", "1", "1", "1", "1", "0"]
+        ["0", "1", "1", "1", "1", "0"]
     ]
 
     maze, start, goal = parse_map(maze_layout)
@@ -272,7 +272,7 @@ def main():
 
     # Align robot with map forward direction
     ORIENTATION_TO_YAW = {"north": math.pi/2, "south": -math.pi/2, "east": 0.0, "west": -math.pi}
-    map_direction_to_align = "west"
+    map_direction_to_align = "south"
     target_map_yaw = ORIENTATION_TO_YAW[map_direction_to_align.lower()]
 
     for _ in range(10):
@@ -296,4 +296,9 @@ def main():
 
     node.stop()
     node.destroy_node()
-    odom
+    odom_reader.destroy_node()
+    imu_reader.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
