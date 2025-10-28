@@ -75,15 +75,9 @@ class CmdVelPublisher(Node):
 
     # ---------------- Holonomic Motion ----------------
     def move_direction(self, dr, dc, odom_sub, distance=GRID_SIZE, speed=0.4):
-        """
-        Move the robot in the direction defined by grid deltas:
-        dr = change in row (positive = down/south)
-        dc = change in col (positive = right/east)
-        """
         rclpy.spin_once(odom_sub)
         start_x, start_y = odom_sub.x_pos, odom_sub.y_pos
 
-        # Map-frame vector in meters
         vx_map = dc * GRID_SIZE
         vy_map = -dr * GRID_SIZE
 
@@ -114,9 +108,6 @@ class CmdVelPublisher(Node):
             sin_yaw = math.sin(fused_yaw)
             linear_x_body =  vx_map_unit * cos_yaw + vy_map_unit * sin_yaw
             linear_y_body = -vx_map_unit * sin_yaw + vy_map_unit * cos_yaw
-
-            print(f"[move_dir] fused_yaw={fused_yaw:+.2f}, yaw_err={yaw_err:+.2f}, "
-                  f"vx_body={linear_x_body:+.2f}, vy_body={linear_y_body:+.2f}, ang_z={angular_z:+.2f}")
 
             self.send_twist(
                 linear_x=linear_x_body,
@@ -210,6 +201,7 @@ def plot_maze(maze, start, goal, path=None, robot_pos=None):
 def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
     plt.ion()
     i = 1
+    current_heading = None  # Track current heading
     while i < len(path):
         cur = path[i-1]
         nxt = path[i]
@@ -227,11 +219,7 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
         rclpy.spin_once(imu_sub)
         odom_sub.imu_yaw = imu_sub.yaw
 
-        # ------------------------------------------------------------
-        # ROTATION LOGIC ADDED HERE — robot always faces travel direction
-        rclpy.spin_once(odom_sub)
-        current_yaw = odom_sub.fused_yaw
-
+        # Determine target yaw
         if dr == -1 and dc == 0:       # North
             target_yaw = math.pi / 2
         elif dr == 1 and dc == 0:      # South
@@ -241,13 +229,17 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
         elif dr == 0 and dc == -1:     # West
             target_yaw = math.pi
         else:
-            target_yaw = current_yaw
+            target_yaw = odom_sub.fused_yaw
 
         target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
-        node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.02, max_speed=0.4)
-        print(f"[follow_path] Rotated to {math.degrees(target_yaw):.1f}° for movement.")
-        # ------------------------------------------------------------
 
+        # Rotate only if heading changes
+        if current_heading is None or abs(math.atan2(math.sin(target_yaw - current_heading),
+                                                     math.cos(target_yaw - current_heading))) > 0.02:
+            node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.02, max_speed=0.4)
+            current_heading = target_yaw
+
+        # Move in the direction
         node.move_direction(dr, dc, odom_sub, distance=total_distance)
         i += run_len
 
@@ -269,15 +261,6 @@ def main():
 
     odom_reader.imu_yaw = imu_reader.yaw
     rclpy.spin_once(odom_reader)
-
-    Zone_ID = 1
-
-    zone_goals = {
-        1: (0,0),
-        2: (0,0)
-    }
-
-    goal_coord = zone_goals.get(Zone_ID, (0, 0))
 
     maze_layout = [
         ["R", "1", "0", "0", "0", "0"],
@@ -313,12 +296,7 @@ def main():
     raw_offset = target_map_yaw - current_fused
     odom_reader.map_yaw_offset = math.atan2(math.sin(raw_offset), math.cos(raw_offset))
 
-    print(f"Aligning: current fused_yaw={current_fused:.3f}, target={target_map_yaw:.3f}, "
-          f"offset={odom_reader.map_yaw_offset:.3f}")
-
-    print("Rotating robot to align forward with map direction...")
     node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.02, max_speed=0.4)
-    print("Rotation complete. Robot is now facing map forward.")
 
     follow_path(node, path, odom_sub=odom_reader, imu_sub=imu_reader,
                 maze=maze, start=start, goal=goal)
