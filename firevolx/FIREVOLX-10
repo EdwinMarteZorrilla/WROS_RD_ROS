@@ -2,13 +2,13 @@
 import time, subprocess, json, paho.mqtt.client as mqtt
 
 # --x-------------- CONFIGURATION ----------------
-BROKERS = ["192.168.149.171", "192.168.149.148"]
+BROKERS = ["192.168.0.149","192.168.0.149"]
 BROKER_PORT = 1883
 TOPIC_FIRE = "alerta/fuego"
 RPI_ID = "FIREVOLX_ROBOT"
 
 # Script paths
-NAVIGATION_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/NAVIGATION-STARTX"
+NAVIGATION_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/NAVIGATION"
 RETURN_NAVIGATION_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/NAVIGATION-FINAL"
 FIRE_FIGHT_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/MQTT-TRANSMITTER-PUMP"
 SERVO_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/PUMP-SERVO"
@@ -18,7 +18,7 @@ SERVO_CAMERA_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/SERVO-CAME
 class FireFighterRobot:
     def __init__(self):
         self.state = "IDLE"
-        self.fire_detected = False
+        self.fire_detected = True
         self.last_rpi = None
 
         # MQTT setup
@@ -35,7 +35,7 @@ class FireFighterRobot:
                 print(f"[MQTT] ⚠️ Could not connect to {ip}: {e}")
             self.mqtt_clients.append(client)
 
-    # --- MQTT ---
+    # ---MQTT ---
     def on_connect(self, client, userdata, flags, rc):
         client.subscribe(TOPIC_FIRE)
         print(f"[MQTT] Subscribed to {TOPIC_FIRE}")
@@ -54,34 +54,35 @@ class FireFighterRobot:
         except Exception as e:
             print(f"[MQTT] ❌ Error processing message: {e}")
 
-    # --- STATE MACHINE ---
+    # ---STATE MACHINE ---
     def run(self):
-        while True:
-            if self.state == "IDLE" and self.fire_detected:
+        while True:   
+           self.fire_detected: True
+           if self.state == "IDLE": #and self.fire_detected:
                 print("[STATE] 🚀 Switching to NAVIGATION")
                 self.state = "NAVIGATION"
 
-            elif self.state == "NAVIGATION":
+           elif self.state == "NAVIGATION":
                 self.navigation_state()
                 self.state = "FIRE_FIGHTING"
 
-            elif self.state == "FIRE_FIGHTING":
+           elif self.state == "FIRE_FIGHTING":
                 self.fire_fighting_state()
                 self.state = "SEARCH"
 
-            elif self.state == "SEARCH":
+           elif self.state == "SEARCH":
                 self.search_state()
                 self.state = "RETURN_NAVIGATION"
 
-            elif self.state == "RETURN_NAVIGATION":
+           elif self.state == "RETURN_NAVIGATION":
                 self.return_navigation_state()
                 self.state = "DONE"
 
-            elif self.state == "DONE":
+           elif self.state == "DONE":
                 self.done_state()
                 self.state = "IDLE"
 
-            time.sleep(0.2)
+           time.sleep(0.2)
 
     # ======== STATES ========
 

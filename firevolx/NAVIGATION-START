@@ -9,12 +9,13 @@ import numpy as np
 from collections import deque
 import matplotlib.pyplot as plt
 import math
-import sys
 
-GRID_SIZE = 0.2  # Xmeters per grid cell
+# ---------------- CONFIG ----------------
+GRID_SIZE = 0.45  # meters per grid cell
 
 # ---------------- IMU Reader ----------------
 class IMUReader(Node):
+    """Reads IMU yaw from /imu"""
     def __init__(self, topic='/imu'):
         super().__init__('imu_reader')
         self.yaw = 0.0
@@ -28,6 +29,7 @@ class IMUReader(Node):
 
 # ---------------- Odometry Reader ----------------
 class OdometryReader(Node):
+    """Reads robot position (x,y) and yaw from /odom, fused with IMU yaw"""
     def __init__(self, topic='/odom'):
         super().__init__('odom_reader')
         self.x_pos = 0.0
@@ -53,6 +55,7 @@ class OdometryReader(Node):
 
 # ---------------- Command Velocity Publisher ----------------
 class CmdVelPublisher(Node):
+    """Publishes Twist commands to control the Mecanum chassis"""
     def __init__(self):
         super().__init__('cmd_vel_publisher')
         self.publisher_ = self.create_publisher(Twist, '/controller/cmd_vel', 10)
@@ -70,12 +73,20 @@ class CmdVelPublisher(Node):
     def stop(self, duration=0.1):
         self.send_twist(0.0, 0.0, 0.0, duration)
 
-    def move_direction(self, dr, dc, odom_sub, distance=GRID_SIZE, speed=0.2):
+    # ---------------- Holonomic Motion ----------------
+    def move_direction(self, dr, dc, odom_sub, distance=GRID_SIZE, speed=0.4):
+        """
+        Move the robot in the direction defined by grid deltas:
+        dr = change in row (positive = down/south)
+        dc = change in col (positive = right/east)
+        """
         rclpy.spin_once(odom_sub)
         start_x, start_y = odom_sub.x_pos, odom_sub.y_pos
 
+        # Map-frame vector in meters
         vx_map = dc * GRID_SIZE
         vy_map = -dr * GRID_SIZE
+
         mag = math.hypot(vx_map, vy_map)
         if mag == 0:
             return
@@ -104,11 +115,19 @@ class CmdVelPublisher(Node):
             linear_x_body =  vx_map_unit * cos_yaw + vy_map_unit * sin_yaw
             linear_y_body = -vx_map_unit * sin_yaw + vy_map_unit * cos_yaw
 
-            self.send_twist(linear_x=linear_x_body, linear_y=linear_y_body,
-                            angular_z=angular_z, duration=0.05)
+            print(f"[move_dir] fused_yaw={fused_yaw:+.2f}, yaw_err={yaw_err:+.2f}, "
+                  f"vx_body={linear_x_body:+.2f}, vy_body={linear_y_body:+.2f}, ang_z={angular_z:+.2f}")
+
+            self.send_twist(
+                linear_x=linear_x_body,
+                linear_y=linear_y_body,
+                angular_z=angular_z,
+                duration=0.05
+            )
         self.stop()
 
-    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.05, max_speed=0.3):
+    # ---------------- Rotate to a specific yaw ----------------
+    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.45, max_speed=0.4):
         while rclpy.ok():
             rclpy.spin_once(odom_sub)
             yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
@@ -121,7 +140,7 @@ class CmdVelPublisher(Node):
             time.sleep(0.05)
         self.stop()
 
-# ---------------- Map Parsing ----------------
+# ---------------- Map Parsing and BFS ----------------
 def parse_map(layout):
     maze = np.zeros((len(layout), len(layout[0])), dtype=int)
     start = goal = None
@@ -131,8 +150,14 @@ def parse_map(layout):
                 maze[r, c] = 1
             elif val == "R":
                 start = (r, c)
+                maze[r, c] = 0
             elif val == "G":
                 goal = (r, c)
+                maze[r, c] = 0
+            else:
+                maze[r, c] = 0
+    if start is None or goal is None:
+        raise ValueError("Map must contain both 'R' (start) and 'G' (goal)!")
     return maze, start, goal
 
 def bfs_path(maze, start, goal):
@@ -161,15 +186,51 @@ def bfs_path(maze, start, goal):
     path.reverse()
     return path
 
-def follow_path(node, path, odom_sub, imu_sub):
+# ---------------- Maze Plot ----------------
+def plot_maze(maze, start, goal, path=None, robot_pos=None):
+    plt.clf()
+    plt.imshow(maze, cmap="gray_r")
+    if path:
+        px, py = zip(*path)
+        plt.plot(py, px, "b.-", label="Path")
+    if robot_pos:
+        x, y = robot_pos
+        gx = int(round(-y / GRID_SIZE))
+        gy = int(round(x / GRID_SIZE))
+        gx = np.clip(gx, 0, maze.shape[0]-1)
+        gy = np.clip(gy, 0, maze.shape[1]-1)
+        plt.plot(gy, gx, "ro", label="Robot")
+    plt.plot(start[1], start[0], "go", markersize=10, label="Start (R)")
+    plt.plot(goal[1], goal[0], "yx", markersize=10, label="Goal (G)")
+    plt.legend()
+    plt.draw()
+    plt.pause(0.001)
+
+# ---------------- Follow Path ----------------
+def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
+    plt.ion()
     i = 1
     while i < len(path):
         cur = path[i-1]
         nxt = path[i]
         dr = nxt[0] - cur[0]
         dc = nxt[1] - cur[1]
-        node.move_direction(dr, dc, odom_sub)
-        i += 1
+
+        # Combine consecutive moves in same direction
+        run_len = 1
+        while (i + run_len < len(path) and
+               path[i + run_len][0] - path[i + run_len - 1][0] == dr and
+               path[i + run_len][1] - path[i + run_len - 1][1] == dc):
+            run_len += 1
+
+        total_distance = GRID_SIZE * run_len
+        rclpy.spin_once(imu_sub)
+        odom_sub.imu_yaw = imu_sub.yaw
+        node.move_direction(dr, dc, odom_sub, distance=total_distance)
+        i += run_len
+
+        rclpy.spin_once(odom_sub)
+        plot_maze(maze, start, goal, path, robot_pos=(odom_sub.x_pos, odom_sub.y_pos))
 
 # ---------------- Main ----------------
 def main():
@@ -178,51 +239,93 @@ def main():
     odom_reader = OdometryReader()
     imu_reader = IMUReader()
 
-    # --- Get RPI_ID argument ---
-    if len(sys.argv) > 1:
-        rpi_id = sys.argv[1].strip().upper()
-    else:
-        rpi_id = "RPI_1"
+    # flush initial readings
+    for _ in range(5):
+        rclpy.spin_once(imu_reader)
+        rclpy.spin_once(odom_reader)
+        time.sleep(0.05)
 
-    rpi_to_zone = {"RPI_1": 1, "RPI_2": 2}
-    Zone_ID = rpi_to_zone.get(rpi_id, 1)
-    print(f"[NAVIGATION] 🚀 Received {rpi_id}, setting Zone_ID = {Zone_ID}")
+    odom_reader.imu_yaw = imu_reader.yaw
+    rclpy.spin_once(odom_reader)
 
-    # --- Zone-specific coordinates ---
-    zone_starts = {
-        1: (4, 0),  # "R" will be placed here
-        2: (2, 2)
-    }
+  # ---------------- Automatic Goal Placement ----------------
+    Zone_ID = 1  # <-- Set this dynamically or manually
 
+    # Define goal coordinates based on Zone_ID
     zone_goals = {
-        1: (0, 0),
-        2: (0, 0)
+        1: (12,0),  # (row, col)
+        2: (12,0)
     }
 
-    start_coord = zone_starts.get(Zone_ID, (0, 0))
-    goal_coord = zone_goals.get(Zone_ID, (5, 5))
+    goal_coord = zone_goals.get(Zone_ID, (12, 0))  # Default if Zone_ID not found
 
     maze_layout = [
-     
+  ["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],
+  ["1","0","0","0","0","0","0","0","0","0","0","1","1","1","1","1","1","1"],
+  ["1","0","0","0","0","0","1","1","1","1","1","1","0","0","0","0","0","R"],
+  ["1","0","0","0","0","0","0","0","1","0","0","1","0","1","1","1","1","0"],
+  ["1","0","0","0","0","1","1","1","1","0","0","1","0","1","0","0","0","1"],
+  ["1","0","0","0","0","0","0","0","0","0","0","1","0","1","0","0","0","0"],
+  ["1","0","0","0","0","0","1","1","1","0","0","1","0","1","0","0","0","0"],
+  ["1","0","0","0","0","0","0","0","0","0","0","1","0","1","0","0","0","0"],
+  ["1","0","0","0","0","1","1","1","1","0","1","1","0","1","0","0","0","0"],
+  ["1","0","0","1","1","1","1","1","0","1","1","1","0","0","0","0","0","0"],
+  ["0","0","0","0","0","0","0","0","0","0","1","1","0","0","0","0","0","0"],
+  ["1","0","0","1","1","1","1","1","1","1","1","1","0","0","0","0","0","0"],
+  ["0","0","0","0","0","0","0" "0","0","0","0","0","0","1","0","0","0","0"]
+
     ]
 
-    # --- Dynamically assign R and G ---
-    sr, sc = start_coord
+    # Place the goal automatically
     gr, gc = goal_coord
-    maze_layout[sr][sc] = "R"
     maze_layout[gr][gc] = "G"
 
     maze, start, goal = parse_map(maze_layout)
     path = bfs_path(maze, start, goal)
 
-    print(f"[NAVIGATION] Path generated from {start} → {goal}")
-    follow_path(node, path, odom_reader, imu_reader)
+    plt.figure()
+    plot_maze(maze, start, goal, path, robot_pos=(odom_reader.x_pos, odom_reader.y_pos))
+
+    # --- Orientation alignment ---
+    ORIENTATION_TO_YAW = {
+        "north": math.pi/2,
+        "south": -math.pi/2,
+        "east": 0.0,
+        "west": -math.pi
+    }
+
+    map_direction_to_align = "south"
+    target_map_yaw = ORIENTATION_TO_YAW[map_direction_to_align.lower()]
+
+    # wait & get stable yaw
+    for _ in range(10):
+        rclpy.spin_once(imu_reader)
+        rclpy.spin_once(odom_reader)
+        time.sleep(0.02)
+
+    current_fused = odom_reader.fused_yaw
+    raw_offset = target_map_yaw - current_fused
+    odom_reader.map_yaw_offset = math.atan2(math.sin(raw_offset), math.cos(raw_offset))
+
+    print(f"Aligning: current fused_yaw={current_fused:.3f}, target={target_map_yaw:.3f}, "
+          f"offset={odom_reader.map_yaw_offset:.3f}")
+
+    # --- Rotate physically to face map forward ---
+    print("Rotating robot to align forward with map direction...")
+    node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.45, max_speed=0.4)
+    print("Rotation complete. Robot is now facing map forward.")
+
+    follow_path(node, path, odom_sub=odom_reader, imu_sub=imu_reader,
+                maze=maze, start=start, goal=goal)
 
     node.stop()
     node.destroy_node()
     odom_reader.destroy_node()
     imu_reader.destroy_node()
     rclpy.shutdown()
-
+   
 if __name__ == "__main__":
     main()
+
+
+

@@ -10,8 +10,8 @@ from collections import deque
 import matplotlib.pyplot as plt
 import math
 
-# ---------------- CONFIG ----------------X
-GRID_SIZE = 0.75  # xxxxmeters per grid cell
+# ---------------- CONFIG ----------------
+GRID_SIZE = 0.50  # meters per grid cell
 
 # ---------------- IMU Reader ----------------
 class IMUReader(Node):
@@ -74,7 +74,7 @@ class CmdVelPublisher(Node):
         self.send_twist(0.0, 0.0, 0.0, duration)
 
     # ---------------- Holonomic Motion ----------------
-    def move_direction(self, dr, dc, odom_sub, distance=GRID_SIZE, speed=0.5):
+    def move_direction(self, dr, dc, odom_sub, distance=GRID_SIZE, speed=0.4):
         """
         Move the robot in the direction defined by grid deltas:
         dr = change in row (positive = down/south)
@@ -127,7 +127,7 @@ class CmdVelPublisher(Node):
         self.stop()
 
     # ---------------- Rotate to a specific yaw ----------------
-    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.05, max_speed=0.5):
+    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.05, max_speed=0.4):
         while rclpy.ok():
             rclpy.spin_once(odom_sub)
             yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
@@ -232,14 +232,14 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
         rclpy.spin_once(odom_sub)
         plot_maze(maze, start, goal, path, robot_pos=(odom_sub.x_pos, odom_sub.y_pos))
 
-# --------x-------- Main ----------------
+# ---------------- Main ----------------
 def main():
     rclpy.init()
     node = CmdVelPublisher()
     odom_reader = OdometryReader()
     imu_reader = IMUReader()
 
-    # flush initxial readingsXxx
+    # flush initial readings
     for _ in range(5):
         rclpy.spin_once(imu_reader)
         rclpy.spin_once(odom_reader)
@@ -248,29 +248,50 @@ def main():
     odom_reader.imu_yaw = imu_reader.yaw
     rclpy.spin_once(odom_reader)
 
+  # ---------------- Automatic Goal Placement ----------------
+    Zone_ID = 1  # <-- Set this dynamically or manually
+
+    # Define goal coordinates based on Zone_ID
+    zone_goals = {
+        1: (12,0),  # (row, col)
+        2: (14, 0)
+    }
+
+    goal_coord = zone_goals.get(Zone_ID, (14, 0))  # Default Xif Zone_ID not found
+
     maze_layout = [
-    ["0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"], 
-    ["1", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"],
-    ["1", "0", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1"],
-    ["1", "0", "0", "0", "1", "0", "0", "1", "0", "0", "0", "R"],
-    ["1", "1", "1", "1", "1", "0", "0", "1", "0", "1", "1", "1"],
-    ["1", "0", "0", "0", "0", "0", "0", "1", "0", "1", "1", "0"],
-    ["1", "0", "1", "1", "1", "0", "0", "1", "0", "1", "1", "0"],
-    ["1", "0", "0", "0", "0", "0", "0", "1", "0", "1", "1", "0"],
-    ["1", "1", "1", "1", "1", "0", "1", "1", "0", "1", "1", "0"],
-    ["G", "0", "0", "0", "0", "0", "0", "0", "0", "1", "1", "0"],
-    ["1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "0"],
-    ["1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "0"]
+  ["0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0","0"],
+  ["1","0","0","0","0","0","0","0","0","0","0","0","1","1","1","1","1","1","1"],
+  ["1","0","0","0","0","0","0","1","1","1","1","1","1","0","0","0","0","0","0"],
+  ["1","0","0","0","0","0","0","0","0","1","0","1","1","0","1","1","1","1","1"],
+  ["1","0","0","0","0","0","1","1","1","1","0","1","1","0","1","0","0","0","1"],
+  ["1","0","0","0","0","0","0","0","0","0","0","1","1","0","1","0","0","0","0"],
+  ["1","0","0","0","0","0","0","1","1","1","0","1","1","0","1","0","0","0","0"],
+  ["1","0","0","0","0","0","0","0","0","0","0","1","1","0","1","0","0","0","0"],
+  ["1","0","0","0","0","0","1","1","1","1","0","1","1","0","1","0","0","0","0"],
+  ["1","0","0","0","1","1","1","1","1","0","1","1","1","0","1","0","0","0","0"],
+  ["0","0","0","0","0","0","0","0","0","0","0","1","1","0","1","0","0","0","0"],
+  ["1","1","1","1","1","1","1","1","1","1","1","1","1","0","1","0","0","0","0"],
+  ["0","0","0","0","0","0","0","0","0","0","0","0","0","R","1","0","0","0","0"],
+  ["0","1","1","1","1","1","1","1","1","1","1","1","1","1","1","0","0","0","0"],
+  ["0","1","0","0","1","1","1","1","1","1","0","0","0","0","1","0","0","0","0"],
+  ["1","0","0","0","0","0","0","0","0","0","0","0","0","0","1","0","0","0","0"],
+  ["0","0","0","0","0","0","0","0","0","0","0","0","0","0","1","0","0","0","0"],
+  ["0","0","0","0","0","0","0","0","0","0","0","0","0","0","1","0","0","0","0"],
+  ["0","0","0","0","0","0","0","0","0","0","0","0","0","0","1","0","0","0","0"]
 
     ]
 
+    # Place the goal automatically
+    gr, gc = goal_coord
+    maze_layout[gr][gc] = "G"
     maze, start, goal = parse_map(maze_layout)
     path = bfs_path(maze, start, goal)
 
     plt.figure()
     plot_maze(maze, start, goal, path, robot_pos=(odom_reader.x_pos, odom_reader.y_pos))
 
-    # --- Orientxation alignment ---
+    #X --- Orientation alignment ---
     ORIENTATION_TO_YAW = {
         "north": math.pi/2,
         "south": -math.pi/2,
@@ -278,7 +299,7 @@ def main():
         "west": -math.pi
     }
 
-    map_direction_to_align = "south"
+    map_direction_to_align = "west"
     target_map_yaw = ORIENTATION_TO_YAW[map_direction_to_align.lower()]
 
     # wait & get stable yaw
@@ -296,7 +317,7 @@ def main():
 
     # --- Rotate physically to face map forward ---
     print("Rotating robot to align forward with map direction...")
-    node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.02, max_speed=0.5)
+    node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.02, max_speed=0.4)
     print("Rotation complete. Robot is now facing map forward.")
 
     follow_path(node, path, odom_sub=odom_reader, imu_sub=imu_reader,
@@ -310,3 +331,5 @@ def main():
    
 if __name__ == "__main__":
     main()
+
+
