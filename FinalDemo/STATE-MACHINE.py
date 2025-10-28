@@ -8,7 +8,11 @@ import os
 BROKERS = ["192.168.149.171", "192.168.149.1"]
 BROKER_PORT = 1883
 TOPIC_FIRE = "alerta/fuego"
-NAVIGATION_SCRIPT = "/programs/navigation.py"
+NAVIGATION_SCRIPT = "NAVIGATION-STARTX"
+RETURN_NAVIGATION_SCRIPT = "NAVIGATION-FINAL"
+FIRE_FIGHT_SCRIPT = "MQTT-TRANSMITTER-PUMP"
+SERVO_SCRIPT = "PUMP-SERVO"
+SERVO_CAMERA_SCRIPT = "SERVO-CAMERA"
 POSE_FILE = "/tmp/robot_pose.json"
 
 class FireFighterRobot:
@@ -122,7 +126,7 @@ class FireFighterRobot:
     def fire_fighting_state(self):
          print("[STATE] FIRE_FIGHTING: Activando bomba de agua y servos simult  neamente...")
 
-        try:
+    try:
             # Lanzar la bomba y el servo en paralelo
             pump_process = subprocess.Popen(["python3", FIRE_FIGHT_SCRIPT])
             servo_process = subprocess.Popen(["python3", SERVO_SCRIPT])
@@ -138,7 +142,7 @@ class FireFighterRobot:
 
             print("[ACTION] Operaci  n de extinci  n completada.")
 
-        except Exception as e:
+    except Exception as e:
             print(f"[ERROR] Error ejecutando scripts simult  neos: {e}")
 
     def done_state(self):

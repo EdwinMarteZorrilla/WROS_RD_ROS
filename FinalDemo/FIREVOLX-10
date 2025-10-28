@@ -8,11 +8,11 @@ TOPIC_FIRE = "alerta/fuego"
 RPI_ID = "FIREVOLX_ROBOT"
 
 # Script paths
-NAVIGATION_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/NAVIGATION-STARTX"
-RETURN_NAVIGATION_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/NAVIGATION-FINAL"
-FIRE_FIGHT_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/MQTT-TRANSMITTER-PUMP"
-SERVO_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/PUMP-SERVO"
-SERVO_CAMERA_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/SERVO-CAMERA"
+NAVIGATION_SCRIPT = "NAVIGATION-STARTX"
+RETURN_NAVIGATION_SCRIPT = "NAVIGATION-FINAL"
+FIRE_FIGHT_SCRIPT = "MQTT-TRANSMITTER-PUMP"
+SERVO_SCRIPT = "PUMP-SERVO"
+SERVO_CAMERA_SCRIPT = "SERVO-CAMERA"
 
 
 class FireFighterRobot:
