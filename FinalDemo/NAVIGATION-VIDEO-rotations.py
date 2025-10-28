@@ -117,18 +117,37 @@ class CmdVelPublisher(Node):
             )
         self.stop()
 
-    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.05, max_speed=0.4):
-        while rclpy.ok():
-            rclpy.spin_once(odom_sub)
-            yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
-                                 math.cos(target_yaw - odom_sub.fused_yaw))
-            if abs(yaw_err) <= yaw_tol:
-                break
-            twist = Twist()
-            twist.angular.z = max(-max_speed, min(max_speed, yaw_err))
-            self.publisher_.publish(twist)
-            time.sleep(0.05)
-        self.stop()
+    # def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.05, max_speed=0.4):
+        # while rclpy.ok():
+            # rclpy.spin_once(odom_sub)
+            # yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
+                                 # math.cos(target_yaw - odom_sub.fused_yaw))
+            # if abs(yaw_err) <= yaw_tol:
+                # break
+            # twist = Twist()
+            # twist.angular.z = max(-max_speed, min(max_speed, yaw_err))
+            # self.publisher_.publish(twist)
+            # time.sleep(0.05)
+        # self.stop
+        
+    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.01, max_speed=0.8):
+    Kp = 2.0
+    while rclpy.ok():
+        rclpy.spin_once(odom_sub)
+        yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
+                             math.cos(target_yaw - odom_sub.fused_yaw))
+        if abs(yaw_err) <= yaw_tol:
+            break
+        angular_z = max(-max_speed, min(max_speed, Kp * yaw_err))
+        # Smooth down when close
+        if abs(yaw_err) < 0.1:
+            angular_z *= abs(yaw_err)/0.1
+        twist = Twist()
+        twist.angular.z = angular_z
+        self.publisher_.publish(twist)
+        time.sleep(0.02)
+    self.stop()
+
 
 # ---------------- Map Parsing and BFS ----------------
 def parse_map(layout):
