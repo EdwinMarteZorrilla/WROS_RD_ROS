@@ -78,6 +78,7 @@ class CmdVelPublisher(Node):
         rclpy.spin_once(odom_sub)
         start_x, start_y = odom_sub.x_pos, odom_sub.y_pos
 
+        # Map-frame vector in meters
         vx_map = dc * GRID_SIZE
         vy_map = -dr * GRID_SIZE
 
@@ -117,18 +118,23 @@ class CmdVelPublisher(Node):
             )
         self.stop()
 
-    # ---------------- Rotate to a specific yaw ----------------
-    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.05, max_speed=0.4):
+    # ---------------- Rotate to a specific yaw (Faster, precise) ----------------
+    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.01, max_speed=0.8):
+        Kp = 2.0  # proportional gain
         while rclpy.ok():
             rclpy.spin_once(odom_sub)
             yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
                                  math.cos(target_yaw - odom_sub.fused_yaw))
             if abs(yaw_err) <= yaw_tol:
                 break
+            angular_z = max(-max_speed, min(max_speed, Kp * yaw_err))
+            # Smooth down when close to target
+            if abs(yaw_err) < 0.1:
+                angular_z *= abs(yaw_err)/0.1
             twist = Twist()
-            twist.angular.z = max(-max_speed, min(max_speed, yaw_err))
+            twist.angular.z = angular_z
             self.publisher_.publish(twist)
-            time.sleep(0.05)
+            time.sleep(0.02)
         self.stop()
 
 # ---------------- Map Parsing and BFS ----------------
@@ -201,7 +207,6 @@ def plot_maze(maze, start, goal, path=None, robot_pos=None):
 def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
     plt.ion()
     i = 1
-    current_heading = None  # Track current heading
     while i < len(path):
         cur = path[i-1]
         nxt = path[i]
@@ -219,7 +224,10 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
         rclpy.spin_once(imu_sub)
         odom_sub.imu_yaw = imu_sub.yaw
 
-        # Determine target yaw
+        # ---------------- ROTATION LOGIC ----------------
+        rclpy.spin_once(odom_sub)
+        current_yaw = odom_sub.fused_yaw
+
         if dr == -1 and dc == 0:       # North
             target_yaw = math.pi / 2
         elif dr == 1 and dc == 0:      # South
@@ -229,17 +237,12 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
         elif dr == 0 and dc == -1:     # West
             target_yaw = math.pi
         else:
-            target_yaw = odom_sub.fused_yaw
+            target_yaw = current_yaw
 
         target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
+        node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.01, max_speed=0.8)
+        # ---------------------------------------------------
 
-        # Rotate only if heading changes
-        if current_heading is None or abs(math.atan2(math.sin(target_yaw - current_heading),
-                                                     math.cos(target_yaw - current_heading))) > 0.02:
-            node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.02, max_speed=0.4)
-            current_heading = target_yaw
-
-        # Move in the direction
         node.move_direction(dr, dc, odom_sub, distance=total_distance)
         i += run_len
 
@@ -262,6 +265,10 @@ def main():
     odom_reader.imu_yaw = imu_reader.yaw
     rclpy.spin_once(odom_reader)
 
+    Zone_ID = 1
+    zone_goals = {1: (0,0), 2: (0,0)}
+    goal_coord = zone_goals.get(Zone_ID, (0, 0))
+
     maze_layout = [
         ["R", "1", "0", "0", "0", "0"],
         ["0", "1", "0", "1", "1", "0"],
@@ -277,13 +284,7 @@ def main():
     plt.figure()
     plot_maze(maze, start, goal, path, robot_pos=(odom_reader.x_pos, odom_reader.y_pos))
 
-    ORIENTATION_TO_YAW = {
-        "north": math.pi/2,
-        "south": -math.pi/2,
-        "east": 0.0,
-        "west": -math.pi
-    }
-
+    ORIENTATION_TO_YAW = {"north": math.pi/2,"south": -math.pi/2,"east": 0.0,"west": -math.pi}
     map_direction_to_align = "west"
     target_map_yaw = ORIENTATION_TO_YAW[map_direction_to_align.lower()]
 
@@ -296,7 +297,7 @@ def main():
     raw_offset = target_map_yaw - current_fused
     odom_reader.map_yaw_offset = math.atan2(math.sin(raw_offset), math.cos(raw_offset))
 
-    node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.02, max_speed=0.4)
+    node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.01, max_speed=0.8)
 
     follow_path(node, path, odom_sub=odom_reader, imu_sub=imu_reader,
                 maze=maze, start=start, goal=goal)
