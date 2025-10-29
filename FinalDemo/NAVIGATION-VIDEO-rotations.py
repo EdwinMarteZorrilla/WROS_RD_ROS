@@ -121,22 +121,23 @@ class CmdVelPublisher(Node):
         self.stop()
 
     # ---------------- Robust Rotation Controller ----------------
-    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.02, max_speed=0.8, timeout=4.0):
+    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.03, max_speed=0.8, timeout=5.0):
         """
-        Robust PID-ish rotation with timeout and min turn speed.
+        Robust rotation to a target yaw with proper completion checking.
         """
         Kp = 2.0
-        Kd = 0.6
+        Kd = 0.5
         Ki = 0.1
         integral = 0.0
         prev_err = None
         prev_time = time.time()
-        min_turn_speed = 0.12
+        min_turn_speed = 0.15
         start_time = time.time()
 
         target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
 
         while rclpy.ok():
+            # Timeout protection
             if (time.time() - start_time) > timeout:
                 self.get_logger().warn(f"rotate_to_yaw: timeout after {timeout}s")
                 break
@@ -152,9 +153,7 @@ class CmdVelPublisher(Node):
             if abs(yaw_err) <= yaw_tol:
                 break
 
-            derivative = 0.0
-            if prev_err is not None:
-                derivative = (yaw_err - prev_err) / dt
+            derivative = (yaw_err - prev_err) / dt if prev_err is not None else 0.0
             prev_err = yaw_err
 
             integral += yaw_err * dt
@@ -163,27 +162,38 @@ class CmdVelPublisher(Node):
             angular = Kp * yaw_err + Ki * integral + Kd * derivative
             angular = max(-max_speed, min(max_speed, angular))
 
-            if abs(angular) < min_turn_speed and abs(yaw_err) > max(0.5*yaw_tol, 0.05):
-                angular = math.copysign(min_turn_speed, yaw_err)
+            if abs(angular) < min_turn_speed:
+                angular = math.copysign(min_turn_speed, angular)
 
+            # Smooth slowdown near target
             if abs(yaw_err) < 0.15:
-                scale = abs(yaw_err) / 0.15
-                angular *= scale
-                if abs(angular) < min_turn_speed and abs(yaw_err) > yaw_tol:
-                    angular = math.copysign(min_turn_speed, yaw_err)
+                angular *= abs(yaw_err) / 0.15
 
             twist = Twist()
             twist.angular.z = angular
             self.publisher_.publish(twist)
 
-            # Debug log
-            self.get_logger().info(
-                f"rot: err={yaw_err:.3f}, ang={angular:.3f}, fused={fused:.3f}, targ={target_yaw:.3f}"
-            )
-
             time.sleep(0.02)
-        self.stop(duration=0.05)
 
+        self.stop(duration=0.1)
+
+        # ✅ Confirm final yaw is reached and stable
+        for _ in range(10):
+            rclpy.spin_once(odom_sub)
+            yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
+                                 math.cos(target_yaw - odom_sub.fused_yaw))
+            if abs(yaw_err) > yaw_tol:
+                # Retry small correction
+                twist = Twist()
+                twist.angular.z = math.copysign(0.12, yaw_err)
+                self.publisher_.publish(twist)
+                time.sleep(0.1)
+                self.stop(duration=0.05)
+            else:
+                break
+
+        # short pause to stabilize IMU reading
+        time.sleep(0.3)
 
 # ---------------- Map Parsing and BFS ----------------
 def parse_map(layout):
@@ -259,12 +269,14 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
     plt.ion()
     i = 1
     prev_dr, prev_dc = 0, 0
+
     while i < len(path):
-        cur = path[i-1]
+        cur = path[i - 1]
         nxt = path[i]
         dr = nxt[0] - cur[0]
         dc = nxt[1] - cur[1]
 
+        # group same-direction segments
         run_len = 1
         while (i + run_len < len(path) and
                path[i + run_len][0] - path[i + run_len - 1][0] == dr and
@@ -272,11 +284,15 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
             run_len += 1
 
         total_distance = GRID_SIZE * run_len
+
+        # update IMU and odometry before motion
         rclpy.spin_once(imu_sub)
         odom_sub.imu_yaw = imu_sub.yaw
+        rclpy.spin_once(odom_sub)
 
-        # Rotate only if heading changes
+        # ------------- ROTATION CONTROL -------------
         if (dr, dc) != (prev_dr, prev_dc):
+            # Determine desired map direction (in radians)
             if dr == -1 and dc == 0:       # North
                 target_yaw = math.pi / 2
             elif dr == 1 and dc == 0:      # South
@@ -288,21 +304,41 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
             else:
                 target_yaw = odom_sub.fused_yaw
 
+            # normalize yaw
             target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
 
             # update sensors before rotation
-            rclpy.spin_once(imu_sub)
-            odom_sub.imu_yaw = imu_sub.yaw
-            rclpy.spin_once(odom_sub)
+            for _ in range(5):
+                rclpy.spin_once(imu_sub)
+                odom_sub.imu_yaw = imu_sub.yaw
+                rclpy.spin_once(odom_sub)
+                time.sleep(0.02)
 
-            node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.02, max_speed=0.4)
+            # perform rotation
+            node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.03, max_speed=0.4)
+
+            # ✅ ensure yaw stabilized before moving forward
+            for _ in range(10):
+                rclpy.spin_once(odom_sub)
+                yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
+                                     math.cos(target_yaw - odom_sub.fused_yaw))
+                if abs(yaw_err) > 0.03:
+                    node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.03, max_speed=0.3)
+                else:
+                    break
+                time.sleep(0.1)
+
+            time.sleep(0.2)
             prev_dr, prev_dc = dr, dc
 
+        # ------------- FORWARD MOTION -------------
         node.move_direction(dr, dc, odom_sub, distance=total_distance)
         i += run_len
 
+        # ------------- VISUALIZATION -------------
         rclpy.spin_once(odom_sub)
         plot_maze(maze, start, goal, path, robot_pos=(odom_sub.x_pos, odom_sub.y_pos))
+
 
 
 # ---------------- Main ----------------
