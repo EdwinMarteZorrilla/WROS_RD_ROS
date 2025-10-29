@@ -121,79 +121,123 @@ class CmdVelPublisher(Node):
         self.stop()
 
     # ---------------- Robust Rotation Controller ----------------
-    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.03, max_speed=0.8, timeout=5.0):
-        """
-        Robust rotation to a target yaw with proper completion checking.
-        """
-        Kp = 2.0
-        Kd = 0.5
-        Ki = 0.1
-        integral = 0.0
-        prev_err = None
-        prev_time = time.time()
-        min_turn_speed = 0.15
-        start_time = time.time()
+    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.03, max_speed=1.0, timeout=4.0):
+    """
+    Faster two-stage rotation:
+      - If yaw error large -> apply fast fixed turn (coarse)
+      - When closer -> PD control for smooth settle (fine)
+      - Short loop period (0.01s) for responsiveness
+    Keep other code intact; tune speeds/gains to your robot.
+    """
+    # PD gains for fine control (tune these)
+    Kp = 3.0
+    Kd = 0.8
+    Ki = 0.05
 
-        target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
+    integral = 0.0
+    prev_err = None
+    prev_time = time.time()
+    start_time = time.time()
 
-        while rclpy.ok():
-            # Timeout protection
-            if (time.time() - start_time) > timeout:
-                self.get_logger().warn(f"rotate_to_yaw: timeout after {timeout}s")
-                break
+    # thresholds (tunable)
+    coarse_threshold = 0.25    # radians: if error > this -> coarse fast rotate
+    coarse_speed = min(1.0, max_speed)  # fixed coarse angular velocity (rad/s)
+    min_turn_speed = 0.18      # ensure we overcome stiction
 
-            rclpy.spin_once(odom_sub)
-            now = time.time()
-            dt = max(1e-3, now - prev_time)
-            prev_time = now
+    # normalize target
+    target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
 
-            fused = odom_sub.fused_yaw
-            yaw_err = math.atan2(math.sin(target_yaw - fused), math.cos(target_yaw - fused))
+    while rclpy.ok():
+        # timeout
+        if (time.time() - start_time) > timeout:
+            self.get_logger().warn(f"rotate_to_yaw: timeout after {timeout}s")
+            break
 
-            if abs(yaw_err) <= yaw_tol:
-                break
+        rclpy.spin_once(odom_sub)
+        now = time.time()
+        dt = max(1e-4, now - prev_time)
+        prev_time = now
 
-            derivative = (yaw_err - prev_err) / dt if prev_err is not None else 0.0
-            prev_err = yaw_err
+        fused = odom_sub.fused_yaw
+        yaw_err = math.atan2(math.sin(target_yaw - fused), math.cos(target_yaw - fused))
+        abs_err = abs(yaw_err)
 
-            integral += yaw_err * dt
-            integral = max(-0.5, min(0.5, integral))
+        # success condition
+        if abs_err <= yaw_tol:
+            break
 
-            angular = Kp * yaw_err + Ki * integral + Kd * derivative
-            angular = max(-max_speed, min(max_speed, angular))
-
-            if abs(angular) < min_turn_speed:
-                angular = math.copysign(min_turn_speed, angular)
-
-            # Smooth slowdown near target
-            if abs(yaw_err) < 0.15:
-                angular *= abs(yaw_err) / 0.15
-
+        # ---- coarse stage ----
+        if abs_err > coarse_threshold:
+            # Command a fast fixed speed (bang-bang) to cover angle quickly
+            ang_cmd = math.copysign(coarse_speed, yaw_err)
+            # Clip to max
+            ang_cmd = max(-max_speed, min(max_speed, ang_cmd))
             twist = Twist()
-            twist.angular.z = angular
+            twist.angular.z = ang_cmd
             self.publisher_.publish(twist)
 
-            time.sleep(0.02)
+            # debug
+            self.get_logger().info(f"[COARSE] err={yaw_err:.3f} cmd={ang_cmd:.3f} fused={fused:.3f}")
 
-        self.stop(duration=0.1)
+            # small sleep to allow motion and faster loop
+            time.sleep(0.01)
+            # continue loop (no integral/derivative here)
+            prev_err = yaw_err
+            continue
 
-        # ✅ Confirm final yaw is reached and stable
-        for _ in range(10):
-            rclpy.spin_once(odom_sub)
-            yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
-                                 math.cos(target_yaw - odom_sub.fused_yaw))
-            if abs(yaw_err) > yaw_tol:
-                # Retry small correction
-                twist = Twist()
-                twist.angular.z = math.copysign(0.12, yaw_err)
-                self.publisher_.publish(twist)
-                time.sleep(0.1)
-                self.stop(duration=0.05)
-            else:
-                break
+        # ---- fine stage (PD) ----
+        derivative = (yaw_err - prev_err) / dt if prev_err is not None else 0.0
+        prev_err = yaw_err
 
-        # short pause to stabilize IMU reading
-        time.sleep(0.3)
+        integral += yaw_err * dt
+        # anti-windup
+        integral = max(-0.5, min(0.5, integral))
+
+        ang_cmd = Kp * yaw_err + Ki * integral + Kd * derivative
+        # clamp
+        ang_cmd = max(-max_speed, min(max_speed, ang_cmd))
+
+        # ensure minimum to overcome stiction when needed
+        if abs(ang_cmd) < min_turn_speed:
+            ang_cmd = math.copysign(min_turn_speed, yaw_err)
+
+        # Gentle scaling when very close (avoid jitter)
+        if abs_err < 0.12:
+            scale = abs_err / 0.12
+            ang_cmd *= scale
+            # still keep a tiny minimum so it moves
+            if abs(ang_cmd) < 0.06:
+                ang_cmd = math.copysign(0.06, yaw_err)
+
+        twist = Twist()
+        twist.angular.z = ang_cmd
+        self.publisher_.publish(twist)
+
+        # debug
+        self.get_logger().info(f"[FINE] err={yaw_err:.3f} cmd={ang_cmd:.3f} fused={fused:.3f}")
+
+        # faster loop for responsiveness
+        time.sleep(0.01)
+
+    # stop and short stabilization
+    self.stop(duration=0.05)
+    # final small correction if needed
+    for _ in range(6):
+        rclpy.spin_once(odom_sub)
+        yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
+                             math.cos(target_yaw - odom_sub.fused_yaw))
+        if abs(yaw_err) <= yaw_tol:
+            break
+        # small corrective nudge
+        twist = Twist()
+        twist.angular.z = math.copysign(0.12, yaw_err)
+        self.publisher_.publish(twist)
+        time.sleep(0.05)
+        self.stop(duration=0.02)
+
+    # small settle pause
+    time.sleep(0.12)
+
 
 # ---------------- Map Parsing and BFS ----------------
 def parse_map(layout):
