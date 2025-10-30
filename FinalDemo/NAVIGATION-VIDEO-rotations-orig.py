@@ -422,4 +422,30 @@ def main():
         rclpy.spin_once(lidar_reader)
         time.sleep(0.02)
 
-    if len
+   
+# Only proceed if path exists
+    if len(path) > 0:
+        # Compute map yaw offset
+        odom_reader.map_yaw_offset = target_map_yaw - odom_reader.fused_yaw
+
+        print("Rotating robot to align forward with map direction...")
+        node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.03, max_speed=MAX_ROT_SPEED)
+
+        # Start following the planned path
+        follow_path(node, path, odom_reader, imu_reader, maze, start, goal, lidar_reader)
+
+    print("Navigation complete!")
+    node.stop()
+    plt.ioff()
+    plt.show()
+
+    # Shutdown ROS
+    node.destroy_node()
+    odom_reader.destroy_node()
+    imu_reader.destroy_node()
+    lidar_reader.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
