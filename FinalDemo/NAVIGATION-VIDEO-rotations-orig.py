@@ -3,7 +3,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, LaserScan
 import time
 import numpy as np
 from collections import deque
@@ -11,8 +11,9 @@ import matplotlib.pyplot as plt
 import math
 
 # ---------------- CONFIG ----------------
-GRID_SIZE = 0.50  # meters per grid cell
-GRID_SIZE = 0.2
+GRID_SIZE = 0.2  # meters per grid cell
+OBJ_DETECT_DISTANCE = 0.2  # meters (20 cm)
+MAX_ROT_SPEED = 1.0  # rad/s, maximum rotation speed globally
 
 # ---------------- IMU Reader ----------------
 class IMUReader(Node):
@@ -27,7 +28,6 @@ class IMUReader(Node):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y*q.y + q.z*q.z)
         self.yaw = math.atan2(siny_cosp, cosy_cosp)
-
 
 # ---------------- Odometry Reader ----------------
 class OdometryReader(Node):
@@ -55,6 +55,35 @@ class OdometryReader(Node):
         self.fused_yaw = math.atan2(math.sin(geographic_yaw + self.map_yaw_offset),
                                     math.cos(geographic_yaw + self.map_yaw_offset))
 
+# ---------------- LIDAR Reader ----------------
+class LidarReader(Node):
+    """Reads front obstacle distance from /scan_raw"""
+    def __init__(self, topic='/scan_raw', stop_distance=OBJ_DETECT_DISTANCE):
+        super().__init__('lidar_reader')
+        self.subscription = self.create_subscription(LaserScan, topic, self.scan_callback, 10)
+        self.front_distance = float('inf')
+        self.stop_distance = stop_distance
+        self.latest_scan = None
+
+    def scan_callback(self, msg):
+        """Compute min front range in ±15° window"""
+        self.latest_scan = msg
+        angles = msg.angle_min + np.arange(len(msg.ranges)) * msg.angle_increment
+        ranges = np.array(msg.ranges, dtype=float)
+        valid = np.isfinite(ranges)
+        angles, ranges = angles[valid], ranges[valid]
+
+        window = np.deg2rad(15)
+        mask = np.abs(angles) <= window
+        front_ranges = ranges[mask]
+        if len(front_ranges) > 0:
+            self.front_distance = np.min(front_ranges)
+        else:
+            self.front_distance = float('inf')
+
+    def obstacle_detected(self):
+        """Return True if obstacle closer than stop_distance"""
+        return self.front_distance <= self.stop_distance
 
 # ---------------- Command Velocity Publisher ----------------
 class CmdVelPublisher(Node):
@@ -121,123 +150,85 @@ class CmdVelPublisher(Node):
         self.stop()
 
     # ---------------- Robust Rotation Controller ----------------
-    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.03, max_speed=1.0, timeout=4.0):
-    """
-    Faster two-stage rotation:
-      - If yaw error large -> apply fast fixed turn (coarse)
-      - When closer -> PD control for smooth settle (fine)
-      - Short loop period (0.01s) for responsiveness
-    Keep other code intact; tune speeds/gains to your robot.
-    """
-    # PD gains for fine control (tune these)
-    Kp = 3.0
-    Kd = 0.8
-    Ki = 0.05
+    def rotate_to_yaw(self, target_yaw, odom_sub, yaw_tol=0.03, max_speed=MAX_ROT_SPEED, timeout=4.0):
+        """
+        Two-stage rotation: coarse-fast + fine PD
+        """
+        Kp = 3.0
+        Kd = 0.8
+        Ki = 0.05
+        integral = 0.0
+        prev_err = None
+        prev_time = time.time()
+        start_time = time.time()
 
-    integral = 0.0
-    prev_err = None
-    prev_time = time.time()
-    start_time = time.time()
+        coarse_threshold = 0.25
+        coarse_speed = min(1.0, max_speed)
+        min_turn_speed = 0.18
 
-    # thresholds (tunable)
-    coarse_threshold = 0.25    # radians: if error > this -> coarse fast rotate
-    coarse_speed = min(1.0, max_speed)  # fixed coarse angular velocity (rad/s)
-    min_turn_speed = 0.18      # ensure we overcome stiction
+        target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
 
-    # normalize target
-    target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
+        while rclpy.ok():
+            if (time.time() - start_time) > timeout:
+                self.get_logger().warn(f"rotate_to_yaw: timeout after {timeout}s")
+                break
 
-    while rclpy.ok():
-        # timeout
-        if (time.time() - start_time) > timeout:
-            self.get_logger().warn(f"rotate_to_yaw: timeout after {timeout}s")
-            break
+            rclpy.spin_once(odom_sub)
+            now = time.time()
+            dt = max(1e-4, now - prev_time)
+            prev_time = now
 
-        rclpy.spin_once(odom_sub)
-        now = time.time()
-        dt = max(1e-4, now - prev_time)
-        prev_time = now
+            fused = odom_sub.fused_yaw
+            yaw_err = math.atan2(math.sin(target_yaw - fused), math.cos(target_yaw - fused))
+            abs_err = abs(yaw_err)
 
-        fused = odom_sub.fused_yaw
-        yaw_err = math.atan2(math.sin(target_yaw - fused), math.cos(target_yaw - fused))
-        abs_err = abs(yaw_err)
+            if abs_err <= yaw_tol:
+                break
 
-        # success condition
-        if abs_err <= yaw_tol:
-            break
+            # ---- coarse stage ----
+            if abs_err > coarse_threshold:
+                ang_cmd = math.copysign(coarse_speed, yaw_err)
+                ang_cmd = max(-max_speed, min(max_speed, ang_cmd))
+                twist = Twist()
+                twist.angular.z = ang_cmd
+                self.publisher_.publish(twist)
+                time.sleep(0.01)
+                prev_err = yaw_err
+                continue
 
-        # ---- coarse stage ----
-        if abs_err > coarse_threshold:
-            # Command a fast fixed speed (bang-bang) to cover angle quickly
-            ang_cmd = math.copysign(coarse_speed, yaw_err)
-            # Clip to max
+            # ---- fine stage ----
+            derivative = (yaw_err - prev_err) / dt if prev_err is not None else 0.0
+            prev_err = yaw_err
+            integral += yaw_err * dt
+            integral = max(-0.5, min(0.5, integral))
+            ang_cmd = Kp * yaw_err + Ki * integral + Kd * derivative
             ang_cmd = max(-max_speed, min(max_speed, ang_cmd))
+            if abs(ang_cmd) < min_turn_speed:
+                ang_cmd = math.copysign(min_turn_speed, yaw_err)
+            if abs_err < 0.12:
+                scale = abs_err / 0.12
+                ang_cmd *= scale
+                if abs(ang_cmd) < 0.06:
+                    ang_cmd = math.copysign(0.06, yaw_err)
+
             twist = Twist()
             twist.angular.z = ang_cmd
             self.publisher_.publish(twist)
-
-            # debug
-            self.get_logger().info(f"[COARSE] err={yaw_err:.3f} cmd={ang_cmd:.3f} fused={fused:.3f}")
-
-            # small sleep to allow motion and faster loop
             time.sleep(0.01)
-            # continue loop (no integral/derivative here)
-            prev_err = yaw_err
-            continue
 
-        # ---- fine stage (PD) ----
-        derivative = (yaw_err - prev_err) / dt if prev_err is not None else 0.0
-        prev_err = yaw_err
-
-        integral += yaw_err * dt
-        # anti-windup
-        integral = max(-0.5, min(0.5, integral))
-
-        ang_cmd = Kp * yaw_err + Ki * integral + Kd * derivative
-        # clamp
-        ang_cmd = max(-max_speed, min(max_speed, ang_cmd))
-
-        # ensure minimum to overcome stiction when needed
-        if abs(ang_cmd) < min_turn_speed:
-            ang_cmd = math.copysign(min_turn_speed, yaw_err)
-
-        # Gentle scaling when very close (avoid jitter)
-        if abs_err < 0.12:
-            scale = abs_err / 0.12
-            ang_cmd *= scale
-            # still keep a tiny minimum so it moves
-            if abs(ang_cmd) < 0.06:
-                ang_cmd = math.copysign(0.06, yaw_err)
-
-        twist = Twist()
-        twist.angular.z = ang_cmd
-        self.publisher_.publish(twist)
-
-        # debug
-        self.get_logger().info(f"[FINE] err={yaw_err:.3f} cmd={ang_cmd:.3f} fused={fused:.3f}")
-
-        # faster loop for responsiveness
-        time.sleep(0.01)
-
-    # stop and short stabilization
-    self.stop(duration=0.05)
-    # final small correction if needed
-    for _ in range(6):
-        rclpy.spin_once(odom_sub)
-        yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
-                             math.cos(target_yaw - odom_sub.fused_yaw))
-        if abs(yaw_err) <= yaw_tol:
-            break
-        # small corrective nudge
-        twist = Twist()
-        twist.angular.z = math.copysign(0.12, yaw_err)
-        self.publisher_.publish(twist)
-        time.sleep(0.05)
-        self.stop(duration=0.02)
-
-    # small settle pause
-    time.sleep(0.12)
-
+        self.stop(duration=0.05)
+        for _ in range(6):
+            rclpy.spin_once(odom_sub)
+            yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
+                                 math.cos(target_yaw - odom_sub.fused_yaw))
+            if abs(yaw_err) <= yaw_tol:
+                break
+            twist = Twist()
+            twist.angular.z = math.copysign(0.12, yaw_err)
+            self.publisher_.publish(twist)
+            time.sleep(0.05)
+            self.stop(duration=0.02)
+        time.sleep(0.12)
 
 # ---------------- Map Parsing and BFS ----------------
 def parse_map(layout):
@@ -258,7 +249,6 @@ def parse_map(layout):
     if start is None or goal is None:
         raise ValueError("Map must contain both 'R' (start) and 'G' (goal)!")
     return maze, start, goal
-
 
 def bfs_path(maze, start, goal):
     visited = np.zeros_like(maze)
@@ -286,7 +276,6 @@ def bfs_path(maze, start, goal):
     path.reverse()
     return path
 
-
 # ---------------- Maze Plot ----------------
 def plot_maze(maze, start, goal, path=None, robot_pos=None):
     plt.clf()
@@ -307,9 +296,8 @@ def plot_maze(maze, start, goal, path=None, robot_pos=None):
     plt.draw()
     plt.pause(0.001)
 
-
 # ---------------- Follow Path ----------------
-def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
+def follow_path(node, path, odom_sub, imu_sub, maze, start, goal, lidar_sub):
     plt.ion()
     i = 1
     prev_dr, prev_dc = 0, 0
@@ -336,38 +324,33 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
 
         # ------------- ROTATION CONTROL -------------
         if (dr, dc) != (prev_dr, prev_dc):
-            # Determine desired map direction (in radians)
-            if dr == -1 and dc == 0:       # North
+            if dr == -1 and dc == 0:
                 target_yaw = math.pi / 2
-            elif dr == 1 and dc == 0:      # South
+            elif dr == 1 and dc == 0:
                 target_yaw = -math.pi / 2
-            elif dr == 0 and dc == 1:      # East
+            elif dr == 0 and dc == 1:
                 target_yaw = 0.0
-            elif dr == 0 and dc == -1:     # West
+            elif dr == 0 and dc == -1:
                 target_yaw = math.pi
             else:
                 target_yaw = odom_sub.fused_yaw
 
-            # normalize yaw
             target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
 
-            # update sensors before rotation
             for _ in range(5):
                 rclpy.spin_once(imu_sub)
                 odom_sub.imu_yaw = imu_sub.yaw
                 rclpy.spin_once(odom_sub)
                 time.sleep(0.02)
 
-            # perform rotation
-            node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.03, max_speed=0.4)
+            node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.03, max_speed=MAX_ROT_SPEED)
 
-            # ✅ ensure yaw stabilized before moving forward
             for _ in range(10):
                 rclpy.spin_once(odom_sub)
                 yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
                                      math.cos(target_yaw - odom_sub.fused_yaw))
                 if abs(yaw_err) > 0.03:
-                    node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.03, max_speed=0.3)
+                    node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.03, max_speed=MAX_ROT_SPEED)
                 else:
                     break
                 time.sleep(0.1)
@@ -375,7 +358,20 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
             time.sleep(0.2)
             prev_dr, prev_dc = dr, dc
 
-        # ------------- FORWARD MOTION -------------
+        # ------------- FORWARD MOTION WITH LIDAR ----------------
+        rclpy.spin_once(lidar_sub)
+        if lidar_sub.obstacle_detected():
+            print(f"⚠️ Obstacle detected ahead at {lidar_sub.front_distance*100:.1f} cm — stopping.")
+            node.stop()
+            next_cell = (round(-odom_sub.y_pos / GRID_SIZE) + dr,
+                         round(odom_sub.x_pos / GRID_SIZE) + dc)
+            maze[next_cell] = 1
+            cur_pos = (round(-odom_sub.y_pos / GRID_SIZE),
+                       round(odom_sub.x_pos / GRID_SIZE))
+            path = bfs_path(maze, cur_pos, goal)
+            i = 1
+            continue
+
         node.move_direction(dr, dc, odom_sub, distance=total_distance)
         i += run_len
 
@@ -383,18 +379,18 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
         rclpy.spin_once(odom_sub)
         plot_maze(maze, start, goal, path, robot_pos=(odom_sub.x_pos, odom_sub.y_pos))
 
-
-
 # ---------------- Main ----------------
 def main():
     rclpy.init()
     node = CmdVelPublisher()
     odom_reader = OdometryReader()
     imu_reader = IMUReader()
+    lidar_reader = LidarReader()
 
     for _ in range(5):
         rclpy.spin_once(imu_reader)
         rclpy.spin_once(odom_reader)
+        rclpy.spin_once(lidar_reader)
         time.sleep(0.05)
 
     odom_reader.imu_yaw = imu_reader.yaw
@@ -419,42 +415,11 @@ def main():
     map_direction_to_align = "south"
     target_map_yaw = ORIENTATION_TO_YAW[map_direction_to_align.lower()]
 
+    # Align map offset
     for _ in range(10):
         rclpy.spin_once(imu_reader)
         rclpy.spin_once(odom_reader)
+        rclpy.spin_once(lidar_reader)
         time.sleep(0.02)
 
-    # ---- Fixed first move detection ----
-    if len(path) >= 2:
-        cur = path[0]
-        nxt = path[1]
-        dr, dc = nxt[0] - cur[0], nxt[1] - cur[1]
-    else:
-        dr, dc = 0, 0
-
-    current_fused = odom_reader.fused_yaw
-    raw_offset = target_map_yaw - current_fused
-    odom_reader.map_yaw_offset = math.atan2(math.sin(raw_offset), math.cos(raw_offset))
-
-    print(f"Aligning: current fused_yaw={current_fused:.3f}, target={target_map_yaw:.3f}, "
-          f"offset={odom_reader.map_yaw_offset:.3f}")
-
-    if dr != 0 and dc == 0:
-        print("First move is forward — skipping initial rotation.")
-    else:
-        print("Rotating robot to align forward with map direction...")
-        node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.02, max_speed=0.4)
-        print("Rotation complete. Robot is now aligned.")
-
-    follow_path(node, path, odom_sub=odom_reader, imu_sub=imu_reader,
-                maze=maze, start=start, goal=goal)
-
-    node.stop()
-    node.destroy_node()
-    odom_reader.destroy_node()
-    imu_reader.destroy_node()
-    rclpy.shutdown()
-
-
-if __name__ == "__main__":
-    main()
+    if len
