@@ -9,10 +9,12 @@ import numpy as np
 from collections import deque
 import matplotlib.pyplot as plt
 import math
+from sensor_msgs.msg import LaserScan
 
 # ---------------- CONFIG ----------------
 GRID_SIZE = 0.50  # meters per grid cell
 GRID_SIZE = 0.2
+objeto_distance=0.2 #distacncia deteccion de objeto (20cm)
 
 # ---------------- IMU Reader ----------------
 class IMUReader(Node):
@@ -54,6 +56,36 @@ class OdometryReader(Node):
         geographic_yaw = alpha * self.odom_yaw + (1 - alpha) * self.imu_yaw
         self.fused_yaw = math.atan2(math.sin(geographic_yaw + self.map_yaw_offset),
                                     math.cos(geographic_yaw + self.map_yaw_offset))
+
+# ---------------- LIDAR Reader ----------------
+class LidarReader(Node):
+    """Reads front obstacle distance from /scan_raw"""
+    def __init__(self, topic='/scan_raw', stop_distance=objeto_distance):
+        super().__init__('lidar_reader')
+        self.subscription = self.create_subscription(LaserScan, topic, self.scan_callback, 10)
+        self.front_distance = float('inf')   # meters
+        self.stop_distance = stop_distance   # meters
+        self.latest_scan = None
+
+    def scan_callback(self, msg):
+        """Compute min front range in ±15° window"""
+        self.latest_scan = msg
+        angles = msg.angle_min + np.arange(len(msg.ranges)) * msg.angle_increment
+        ranges = np.array(msg.ranges, dtype=float)
+        valid = np.isfinite(ranges)
+        angles, ranges = angles[valid], ranges[valid]
+
+        window = np.deg2rad(15)
+        mask = np.abs(angles) <= window
+        front_ranges = ranges[mask]
+        if len(front_ranges) > 0:
+            self.front_distance = np.min(front_ranges)
+        else:
+            self.front_distance = float('inf')
+
+    def obstacle_detected(self):
+        """Return True if obstacle closer than stop_distance"""
+        return self.front_distance <= self.stop_distance
 
 
 # ---------------- Command Velocity Publisher ----------------
@@ -130,9 +162,21 @@ class CmdVelPublisher(Node):
     Keep other code intact; tune speeds/gains to your robot.
     """
     # PD gains for fine control (tune these)
+    
+        # Parameter	Suggested Value	Notes
+    # Kp (Proportional)	2.5 – 3.0	Increases turning speed. Start at 2.5 and raise slowly.
+    # Kd (Derivative)	0.6 – 0.8	Damps overshoot. Higher if Kp causes wobble.
+    # Ki (Integral)	0.05 – 0.1	Small value to correct minor steady-state drift.
+    # max_speed	1.0 – 1.2 rad/s	Upper limit on angular velocity. Do not exceed 1.5.
+    # min_turn_speed	0.20 – 0.25 rad/s	Helps overcome static friction at the start of the turn.
+    
     Kp = 3.0
     Kd = 0.8
     Ki = 0.05
+    ############################################
+    #Rotation Speed
+    ############################################
+    rot_speed = 0.8
 
     integral = 0.0
     prev_err = None
@@ -309,7 +353,8 @@ def plot_maze(maze, start, goal, path=None, robot_pos=None):
 
 
 # ---------------- Follow Path ----------------
-def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
+#def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
+def follow_path(node, path, odom_sub, imu_sub, maze, start, goal, lidar_sub):
     plt.ion()
     i = 1
     prev_dr, prev_dc = 0, 0
@@ -359,7 +404,7 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
                 time.sleep(0.02)
 
             # perform rotation
-            node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.03, max_speed=0.4)
+            node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.03, max_speed=rot_speed)
 
             # ✅ ensure yaw stabilized before moving forward
             for _ in range(10):
@@ -367,7 +412,9 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
                 yaw_err = math.atan2(math.sin(target_yaw - odom_sub.fused_yaw),
                                      math.cos(target_yaw - odom_sub.fused_yaw))
                 if abs(yaw_err) > 0.03:
-                    node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.03, max_speed=0.3)
+                    #node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.03, max_speed=0.3)
+                    node.rotate_to_yaw(target_yaw, odom_sub, yaw_tol=0.03, max_speed=rot_speed)
+                    
                 else:
                     break
                 time.sleep(0.1)
@@ -376,8 +423,28 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
             prev_dr, prev_dc = dr, dc
 
         # ------------- FORWARD MOTION -------------
+        
+        rclpy.spin_once(lidar_sub)
+        if lidar_sub.obstacle_detected():
+            print(f"⚠️ Obstacle detected ahead at {lidar_sub.front_distance*100:.1f} cm — stopping.")
+            node.stop()
+
+            # Mark the obstacle in the maze
+            next_cell = (round(-odom_sub.y_pos / GRID_SIZE) + dr,
+                         round(odom_sub.x_pos / GRID_SIZE) + dc)
+            maze[next_cell] = 1  # mark as blocked
+
+            # Replan path from current position
+            cur_pos = (round(-odom_sub.y_pos / GRID_SIZE),
+                       round(odom_sub.x_pos / GRID_SIZE))
+            path = bfs_path(maze, cur_pos, goal)
+            i = 1  # start following new path
+            break  # skip moving this segment
+
+        # Move into the next grid cell if no obstacle
         node.move_direction(dr, dc, odom_sub, distance=total_distance)
         i += run_len
+
 
         # ------------- VISUALIZATION -------------
         rclpy.spin_once(odom_sub)
@@ -443,18 +510,32 @@ def main():
         print("First move is forward — skipping initial rotation.")
     else:
         print("Rotating robot to align forward with map direction...")
-        node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.02, max_speed=0.4)
+        #node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.02, max_speed=0.4)
+        node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.02, max_speed=rot_speed)
+        
         print("Rotation complete. Robot is now aligned.")
 
+    # follow_path(node, path, odom_sub=odom_reader, imu_sub=imu_reader,
+                # maze=maze, start=start, goal=goal)
+    
     follow_path(node, path, odom_sub=odom_reader, imu_sub=imu_reader,
-                maze=maze, start=start, goal=goal)
-
+                maze=maze, start=start, goal=goal, lidar_reader)      
     node.stop()
     node.destroy_node()
     odom_reader.destroy_node()
     imu_reader.destroy_node()
+    lidar_reader.destroy_node()
     rclpy.shutdown()
 
 
 if __name__ == "__main__":
     main()
+
+#Notes for LIDAR 
+#ADD from sensor_msgs.msg import LaserScan
+#ADD Class class LidarReader(Node):
+#In MAIN
+#ADD   lidar_reader.destroy_node()
+#And pass it to follow_path:
+#follow_path(node, path, odom_reader, imu_reader, maze, start, goal, #lidar_reader)
+#Modify follow_path() to use lidar
