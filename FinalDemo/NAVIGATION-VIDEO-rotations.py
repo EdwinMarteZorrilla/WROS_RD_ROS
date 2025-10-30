@@ -354,7 +354,7 @@ def plot_maze(maze, start, goal, path=None, robot_pos=None):
 
 # ---------------- Follow Path ----------------
 #def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
-def follow_path(node, path, odom_sub, imu_sub, maze, start, goal,lidar_sub=lidar_reader)
+def follow_path(node, path, odom_sub, imu_sub, maze, start, goal,lidar_sub):
     plt.ion()
     i = 1
     prev_dr, prev_dc = 0, 0
@@ -489,7 +489,7 @@ def main():
     for _ in range(10):
         rclpy.spin_once(imu_reader)
         rclpy.spin_once(odom_reader)
-        rclpy.spin_once(lidar_reader)
+        rclpy.spin_once(lidar_sub)
         time.sleep(0.02)
 
     # ---- Fixed first move detection ----
@@ -519,8 +519,8 @@ def main():
     # follow_path(node, path, odom_sub=odom_reader, imu_sub=imu_reader,
                 # maze=maze, start=start, goal=goal)
     
-    follow_path(node, path, odom_sub=odom_reader, imu_sub=imu_reader,
-                maze=maze, start=start, goal=goal, lidar_reader)      
+                    
+    follow_path(node, path, odom_reader, imu_reader, maze, start, goal, lidar_reader)            
     node.stop()
     node.destroy_node()
     odom_reader.destroy_node()
