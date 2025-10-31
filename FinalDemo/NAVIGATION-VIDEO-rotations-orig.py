@@ -56,34 +56,34 @@ class OdometryReader(Node):
                                     math.cos(geographic_yaw + self.map_yaw_offset))
 
 # ---------------- LIDAR Reader ----------------
-class LidarReader(Node):
-    """Reads front obstacle distance from /scan_raw"""
-    def __init__(self, topic='/scan_raw', stop_distance=OBJ_DETECT_DISTANCE):
-        super().__init__('lidar_reader')
-        self.subscription = self.create_subscription(LaserScan, topic, self.scan_callback, 10)
-        self.front_distance = float('inf')
-        self.stop_distance = stop_distance
-        self.latest_scan = None
+# class LidarReader(Node):
+    # """Reads front obstacle distance from /scan_raw"""
+    # def __init__(self, topic='/scan_raw', stop_distance=OBJ_DETECT_DISTANCE):
+        # super().__init__('lidar_reader')
+        # self.subscription = self.create_subscription(LaserScan, topic, self.scan_callback, 10)
+        # self.front_distance = float('inf')
+        # self.stop_distance = stop_distance
+        # self.latest_scan = None
 
-    def scan_callback(self, msg):
-        """Compute min front range in ±15° window"""
-        self.latest_scan = msg
-        angles = msg.angle_min + np.arange(len(msg.ranges)) * msg.angle_increment
-        ranges = np.array(msg.ranges, dtype=float)
-        valid = np.isfinite(ranges)
-        angles, ranges = angles[valid], ranges[valid]
+    # def scan_callback(self, msg):
+        # """Compute min front range in ±15° window"""
+        # self.latest_scan = msg
+        # angles = msg.angle_min + np.arange(len(msg.ranges)) * msg.angle_increment
+        # ranges = np.array(msg.ranges, dtype=float)
+        # valid = np.isfinite(ranges)
+        # angles, ranges = angles[valid], ranges[valid]
 
-        window = np.deg2rad(15)
-        mask = np.abs(angles) <= window
-        front_ranges = ranges[mask]
-        if len(front_ranges) > 0:
-            self.front_distance = np.min(front_ranges)
-        else:
-            self.front_distance = float('inf')
+        # window = np.deg2rad(15)
+        # mask = np.abs(angles) <= window
+        # front_ranges = ranges[mask]
+        # if len(front_ranges) > 0:
+            # self.front_distance = np.min(front_ranges)
+        # else:
+            # self.front_distance = float('inf')
 
-    def obstacle_detected(self):
-        """Return True if obstacle closer than stop_distance"""
-        return self.front_distance <= self.stop_distance
+    # def obstacle_detected(self):
+        # """Return True if obstacle closer than stop_distance"""
+        # return self.front_distance <= self.stop_distance
 
 # ---------------- Command Velocity Publisher ----------------
 class CmdVelPublisher(Node):
@@ -297,7 +297,8 @@ def plot_maze(maze, start, goal, path=None, robot_pos=None):
     plt.pause(0.001)
 
 # ---------------- Follow Path ----------------
-def follow_path(node, path, odom_sub, imu_sub, maze, start, goal, lidar_sub):
+#def follow_path(node, path, odom_sub, imu_sub, maze, start, goal, lidar_sub):
+def follow_path(node, path, odom_sub, imu_sub, maze, start, goal):
     plt.ion()
     i = 1
     prev_dr, prev_dc = 0, 0
@@ -359,18 +360,18 @@ def follow_path(node, path, odom_sub, imu_sub, maze, start, goal, lidar_sub):
             prev_dr, prev_dc = dr, dc
 
         # ------------- FORWARD MOTION WITH LIDAR ----------------
-        rclpy.spin_once(lidar_sub)
-        if lidar_sub.obstacle_detected():
-            print(f"⚠️ Obstacle detected ahead at {lidar_sub.front_distance*100:.1f} cm — stopping.")
-            node.stop()
-            next_cell = (round(-odom_sub.y_pos / GRID_SIZE) + dr,
-                         round(odom_sub.x_pos / GRID_SIZE) + dc)
-            maze[next_cell] = 1
-            cur_pos = (round(-odom_sub.y_pos / GRID_SIZE),
-                       round(odom_sub.x_pos / GRID_SIZE))
-            path = bfs_path(maze, cur_pos, goal)
-            i = 1
-            continue
+        # rclpy.spin_once(lidar_sub)
+        # if lidar_sub.obstacle_detected():
+            # print(f"⚠️ Obstacle detected ahead at {lidar_sub.front_distance*100:.1f} cm — stopping.")
+            # node.stop()
+            # next_cell = (round(-odom_sub.y_pos / GRID_SIZE) + dr,
+                         # round(odom_sub.x_pos / GRID_SIZE) + dc)
+            # maze[next_cell] = 1
+            # cur_pos = (round(-odom_sub.y_pos / GRID_SIZE),
+                       # round(odom_sub.x_pos / GRID_SIZE))
+            # path = bfs_path(maze, cur_pos, goal)
+            # i = 1
+            # continue
 
         node.move_direction(dr, dc, odom_sub, distance=total_distance)
         i += run_len
@@ -385,12 +386,12 @@ def main():
     node = CmdVelPublisher()
     odom_reader = OdometryReader()
     imu_reader = IMUReader()
-    lidar_reader = LidarReader()
+    #lidar_reader = LidarReader()
 
     for _ in range(5):
         rclpy.spin_once(imu_reader)
         rclpy.spin_once(odom_reader)
-        rclpy.spin_once(lidar_reader)
+        #rclpy.spin_once(lidar_reader)
         time.sleep(0.05)
 
     odom_reader.imu_yaw = imu_reader.yaw
@@ -419,7 +420,7 @@ def main():
     for _ in range(10):
         rclpy.spin_once(imu_reader)
         rclpy.spin_once(odom_reader)
-        rclpy.spin_once(lidar_reader)
+        #rclpy.spin_once(lidar_reader)
         time.sleep(0.02)
 
    
@@ -432,7 +433,8 @@ def main():
         node.rotate_to_yaw(target_map_yaw, odom_reader, yaw_tol=0.03, max_speed=MAX_ROT_SPEED)
 
         # Start following the planned path
-        follow_path(node, path, odom_reader, imu_reader, maze, start, goal, lidar_reader)
+        #follow_path(node, path, odom_reader, imu_reader, maze, start, goal, lidar_reader)
+        follow_path(node, path, odom_reader, imu_reader, maze, start, goal)
 
     print("Navigation complete!")
     node.stop()
@@ -443,7 +445,7 @@ def main():
     node.destroy_node()
     odom_reader.destroy_node()
     imu_reader.destroy_node()
-    lidar_reader.destroy_node()
+    #lidar_reader.destroy_node()
     rclpy.shutdown()
 
 
