@@ -1,7 +1,7 @@
-X#!/usr/bin/env python3
+#!/usr/bin/env python3
 import time, subprocess, json, paho.mqtt.client as mqtt
 
-# --x-------------- CONFIGURATION ----------------
+# -x-x-------------- CONFIGURATION ----------------
 BROKERS = ["192.168.0.135", "192.168.149.148"]
 BROKER_PORT = 1883
 TOPIC_FIRE = "alerta/fuego"
@@ -9,7 +9,7 @@ RPI_ID = "FIREVOLX_ROBOT"
 
 # Script paths
 NAVIGATION_SCRIPT = "NAVIGATION-VIDEO-rotations-orig.py"
-#RETURN_NAVIGATION_SCRIPT = "NAVIGATION-FINAL"
+#xxRETURN_NAVIGATION_SCRIPT = "NAVIGATION-FINAL"
 FIRE_FIGHT_SCRIPT = "MQTT-TRANSMITTER-PUMP"
 SERVO_SCRIPT = "PUMP-SERVO"
 SERVO_CAMERA_SCRIPT = "SERVO-CAMERA"
@@ -18,10 +18,10 @@ SERVO_CAMERA_SCRIPT = "SERVO-CAMERA"
 class FireFighterRobot:
     def __init__(self):
         self.state = "IDLE"
-        self.fire_detected = True 
+        self.fire_detected = True  # Start as True so it goes through states
         self.last_rpi = None
 
-        # MQTT setup
+        # MQTT setup (optional, will still work without signals)
         self.mqtt_clients = []
         for ip in BROKERS:
             client = mqtt.Client()
@@ -30,9 +30,9 @@ class FireFighterRobot:
             try:
                 client.connect(ip, BROKER_PORT, 60)
                 client.loop_start()
-                print(f"[MQTT] ✅ Connected to broker {ip}")
+                print(f"[MQTT] Connected to broker {ip}")
             except Exception as e:
-                print(f"[MQTT] ⚠️ Could not connect to {ip}: {e}")
+                print(f"[MQTT] Could not connect to {ip}: {e}")
             self.mqtt_clients.append(client)
 
     # --- MQTT ---
@@ -47,19 +47,19 @@ class FireFighterRobot:
             rpi_id = payload.get("rpi_id", "UNKNOWN")
 
             if msg.topic == TOPIC_FIRE and label in ["fire", "cigar", "fireball"]:
-                print(f"[MQTT] 🔥 Fire signal detected from {rpi_id}: {label}")
+                print(f"[MQTT] Fire signal detected from {rpi_id}: {label}")
                 self.fire_detected = True
                 self.last_rpi = rpi_id
 
         except Exception as e:
-            print(f"[MQTT] ❌ Error processing message: {e}")
+            print(f"[MQTT] Error processing message: {e}")
 
     # --- STATE MACHINE ---
     def run(self):
         while True:
-            self.fire_detected: True 
-            if self.state == "IDLE": # and self.fire_detected:
-                print("[STATE] 🚀 Switching to NAVIGATION")
+            # Always process states sequentially, no need for MQTT signal
+            if self.state == "IDLE":
+                print("[STATE] Switching to NAVIGATION")
                 self.state = "NAVIGATION"
 
             elif self.state == "NAVIGATION":
@@ -85,45 +85,44 @@ class FireFighterRobot:
             time.sleep(0.2)
 
     # ======== STATES ========
-
     def navigation_state(self):
         try:
-            print("[STATE] 🧭 NAVIGATION: Moving toward fire zone...")
+            print("[STATE] NAVIGATION: Moving toward fire zone...")
             subprocess.run(["python3", NAVIGATION_SCRIPT, str(self.last_rpi)], check=True)
         except Exception as e:
-            print(f"[ERROR] ❌ NAVIGATION: {e}")
+            print(f"[ERROR] NAVIGATION: {e}")
 
     def fire_fighting_state(self):
-        print("[STATE] 💦 FIRE_FIGHTING: Activating pump and servo.")
+        print("[STATE] FIRE_FIGHTING: Activating pump and servo.")
         try:
             pump = subprocess.Popen(["python3", FIRE_FIGHT_SCRIPT])
             servo = subprocess.Popen(["python3", SERVO_SCRIPT])
             time.sleep(6)
             pump.terminate()
             servo.terminate()
-            print("[ACTION] ✅ Fire extinguishing completed.")
+            print("[ACTION] Fire extinguishing completed.")
         except Exception as e:
-            print(f"[ERROR] ❌ FIRE_FIGHTING: {e}")
+            print(f"[ERROR] FIRE_FIGHTING: {e}")
 
     def search_state(self):
         try:
-            print("[STATE] 🎥 SEARCH: Moving servo camera (no detection).")
+            print("[STATE] SEARCH: Moving servo camera (no detection).")
             servo_process = subprocess.Popen(["python3", SERVO_CAMERA_SCRIPT])
-            time.sleep(10)  # Run servo camera for 10 seconds (adjust as needed)
+            time.sleep(10)
             servo_process.terminate()
-            print("[SEARCH] ✅ Servo camera movement finished.")
+            print("[SEARCH] Servo camera movement finished.")
         except Exception as e:
-            print(f"[ERROR] ❌ SEARCH: {e}")
+            print(f"[ERROR] SEARCH: {e}")
 
     def return_navigation_state(self):
-        print("[STATE] 🏁 RETURN_NAVIGATION: Returning to origin.")
+        print("[STATE] RETURN_NAVIGATION: Returning to origin.")
         try:
             subprocess.run(["python3", RETURN_NAVIGATION_SCRIPT, str(self.last_rpi)], check=True)
         except Exception as e:
-            print(f"[ERROR] ❌ RETURN_NAVIGATION: {e}")
+            print(f"[ERROR] RETURN_NAVIGATION: {e}")
 
     def done_state(self):
-        print("[STATE] 🔄 DONE: Resetting to IDLE.")
+        print("[STATE] DONE: Resetting to IDLE.")
         self.fire_detected = False
         self.last_rpi = None
 
