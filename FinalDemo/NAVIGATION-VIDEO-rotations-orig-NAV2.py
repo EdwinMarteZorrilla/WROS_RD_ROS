@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, PoseStamped
+from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, LaserScan
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
 import time
@@ -13,9 +13,10 @@ from collections import deque
 import matplotlib.pyplot as plt
 
 # ---------------- CONFIG ----------------
-GRID_SIZE = 0.2   # meters per grid cell
-ROBOT_INITIAL_HEADING_DEG = 180  # Robot starts facing South in real Nav2 map
-rot_speed = 0.8
+GRID_SIZE = 0.2
+ROBOT_INITIAL_HEADING_DEG = 180  # Robot starts facing South
+FRONT_ANGLE_WINDOW_DEG = 15
+OBSTACLE_DISTANCE_THRESHOLD = 0.10
 
 # ---------------- IMU Reader ----------------
 class IMUReader(Node):
@@ -37,9 +38,6 @@ class OdometryReader(Node):
         self.x_pos = 0.0
         self.y_pos = 0.0
         self.odom_yaw = 0.0
-        self.imu_yaw = 0.0
-        self.map_yaw_offset = 0.0
-        self.fused_yaw = 0.0
         self.subscription = self.create_subscription(Odometry, topic, self.odom_callback, 10)
 
     def odom_callback(self, msg):
@@ -49,14 +47,9 @@ class OdometryReader(Node):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y*q.y + q.z*q.z)
         self.odom_yaw = math.atan2(siny_cosp, cosy_cosp)
-        alpha = 0.98
-        geographic_yaw = alpha * self.odom_yaw + (1 - alpha) * self.imu_yaw
-        self.fused_yaw = math.atan2(math.sin(geographic_yaw + self.map_yaw_offset),
-                                    math.cos(geographic_yaw + self.map_yaw_offset))
 
 # ---------------- Nav2 Goal Sender ----------------
 class Nav2Client(Node):
-    """Sends goals to Nav2 for autonomous movement"""
     def __init__(self):
         super().__init__('nav2_client')
         self.client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
@@ -67,19 +60,42 @@ class Nav2Client(Node):
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
         goal_msg.pose.pose.position.x = x
         goal_msg.pose.pose.position.y = y
-
-        # Convert yaw (in radians) to quaternion
         qz = math.sin(yaw / 2.0)
         qw = math.cos(yaw / 2.0)
         goal_msg.pose.pose.orientation.z = qz
         goal_msg.pose.pose.orientation.w = qw
-
         self.client.wait_for_server()
-        send_future = self.client.send_goal_async(goal_msg)
+        self.client.send_goal_async(goal_msg)
         self.get_logger().info(f"Goal sent: x={x:.2f}, y={y:.2f}, yaw={math.degrees(yaw):.1f}°")
-        return send_future
 
-# ---------------- Map Parsing and BFS ----------------
+# ---------------- Front Lidar ----------------
+class FrontLidar(Node):
+    def __init__(self, topic='/scan'):
+        super().__init__('front_lidar')
+        self.min_distance = float('inf')
+        self.subscription = self.create_subscription(LaserScan, topic, self.scan_callback, 10)
+
+    def scan_callback(self, msg):
+        total_points = len(msg.ranges)
+        angle_min = msg.angle_min
+        angle_increment = msg.angle_increment
+        front_angle_rad = math.radians(FRONT_ANGLE_WINDOW_DEG)
+
+        start_idx = int((0 - front_angle_rad - angle_min) / angle_increment)
+        end_idx = int((0 + front_angle_rad - angle_min) / angle_increment)
+        start_idx = max(0, start_idx)
+        end_idx = min(total_points - 1, end_idx)
+
+        front_ranges = [r for r in msg.ranges[start_idx:end_idx+1] if r > 0.0]
+        if front_ranges:
+            self.min_distance = min(front_ranges)
+        else:
+            self.min_distance = float('inf')
+
+    def is_obstacle_ahead(self):
+        return self.min_distance < OBSTACLE_DISTANCE_THRESHOLD
+
+# ---------------- BFS ----------------
 def parse_map(layout):
     maze = np.zeros((len(layout), len(layout[0])), dtype=int)
     start = goal = None
@@ -89,14 +105,8 @@ def parse_map(layout):
                 maze[r, c] = 1
             elif val == "R":
                 start = (r, c)
-                maze[r, c] = 0
             elif val == "G":
                 goal = (r, c)
-                maze[r, c] = 0
-            else:
-                maze[r, c] = 0
-    if start is None or goal is None:
-        raise ValueError("Map must contain both 'R' (start) and 'G' (goal)!")
     return maze, start, goal
 
 def bfs_path(maze, start, goal):
@@ -125,90 +135,80 @@ def bfs_path(maze, start, goal):
     path.reverse()
     return path
 
-# ---------------- Follow Path Using Nav2 ----------------
-def follow_path_nav2(nav2_client, path, maze):
-    """Send each BFS cell as a goal to Nav2, aligned with real map orientation."""
-    for i in range(1, len(path)):
+# ---------------- Follow path with live plot ----------------
+def follow_path_live(nav2_client, lidar, odom_reader, path, maze):
+    plt.figure()
+    plt.imshow(maze, cmap="gray_r")
+    plt.plot([c[1] for c in path], [c[0] for c in path], "b.-")
+    plt.title("Robot BFS Navigation")
+    robot_marker, = plt.plot([], [], "ro", markersize=10)
+    plt.show(block=False)
+
+    i = 1
+    while i < len(path):
         cur = path[i-1]
         nxt = path[i]
         dr = nxt[0] - cur[0]
         dc = nxt[1] - cur[1]
 
-        # --- FIX 1: Flip Y axis so BFS top row = Nav2 North ---
         x_map = nxt[1] * GRID_SIZE
         y_map = (maze.shape[0] - 1 - nxt[0]) * GRID_SIZE
 
-        # --- FIX 2: Compute yaw relative to BFS direction ---
         yaw = 0.0
-        if dr == -1 and dc == 0:
-            yaw = math.pi/2      # North
-        elif dr == 1 and dc == 0:
-            yaw = -math.pi/2     # South
-        elif dr == 0 and dc == 1:
-            yaw = 0.0            # East
-        elif dr == 0 and dc == -1:
-            yaw = math.pi        # West
-
-        # --- FIX 3: Apply robot's initial heading offset (facing South) ---
+        if dr == -1 and dc == 0: yaw = math.pi/2
+        elif dr == 1 and dc == 0: yaw = -math.pi/2
+        elif dr == 0 and dc == 1: yaw = 0.0
+        elif dr == 0 and dc == -1: yaw = math.pi
         yaw += math.radians(ROBOT_INITIAL_HEADING_DEG)
-        yaw = math.atan2(math.sin(yaw), math.cos(yaw))  # normalize
+        yaw = math.atan2(math.sin(yaw), math.cos(yaw))
 
-        nav2_client.get_logger().info(
-            f"Sending goal {i}/{len(path)-1}: x={x_map:.2f}, y={y_map:.2f}, yaw={math.degrees(yaw):.1f}°"
-        )
+        if lidar.is_obstacle_ahead():
+            nav2_client.get_logger().info("Front obstacle detected. Pausing...")
+            while lidar.is_obstacle_ahead():
+                time.sleep(0.05)
+            nav2_client.get_logger().info("Path clear. Resuming.")
 
         nav2_client.send_goal(x_map, y_map, yaw)
-        time.sleep(1.0)  # Give Nav2 time to start motion (simplified)
+        time.sleep(0.2)
+
+        # Update robot marker using odometry
+        robot_marker.set_data(odom_reader.x_pos / GRID_SIZE, maze.shape[0]-1 - odom_reader.y_pos / GRID_SIZE)
+        plt.pause(0.05)
+        i += 1
 
 # ---------------- Main ----------------
 def main():
     rclpy.init()
     nav2_client = Nav2Client()
+    lidar = FrontLidar()
+    odom_reader = OdometryReader()
 
-    # BFS layout stays unchanged
     maze_layout = [
-        ["R", "1", "0", "0", "0", "0"],
-        ["0", "1", "0", "1", "1", "0"],
-        ["0", "0", "0", "1", "0", "0"],
-        ["0", "1", "1", "1", "0", "1"],
-        ["0", "0", "1", "0", "0", "0"],
-        ["G", "1", "1", "1", "1", "0"]
+        ["R","1","0","0","0","0"],
+        ["0","1","0","1","1","0"],
+        ["0","0","0","1","0","0"],
+        ["0","1","1","1","0","1"],
+        ["0","0","1","0","0","0"],
+        ["G","1","1","1","1","0"]
     ]
-
     maze, start, goal = parse_map(maze_layout)
     path = bfs_path(maze, start, goal)
 
-    # Plot the map for visualization (non-blocking)
-    plt.figure()
-    plt.imshow(maze, cmap="gray_r")
-    plt.plot([c[1] for c in path], [c[0] for c in path], "b.-")
-    plt.plot(start[1], start[0], "go")
-    plt.plot(goal[1], goal[0], "yx")
-    plt.title("BFS Path")
-    plt.pause(0.001)  # allows robot to continue moving while showing plot
-
-    follow_path_nav2(nav2_client, path, maze)
-
+    follow_path_live(nav2_client, lidar, odom_reader, path, maze)
     rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
 
 
-# Fix	Description	Effect
-# Flip Y axis	Converts BFS’s “top row = North” to Nav2’s “+Y = North”	Aligns BFS grid with real-world map
-# Apply yaw offset	Adjusts every goal by robot’s initial heading (e.g., 180° = South)	Robot moves “forward” for this map even if it starts facing South
-# Non-blocking plot	Uses plt.pause() instead of blocking plt.show()	Lets robot move while visualizing path
-# Clear comments	Added so you can easily tweak orientation later
+# ✅ Features Added
 
-# 🚀 Result
+# Live robot marker (red dot) updated from odometry.
 
-# For your given map:
+# BFS path is still plotted (blue line).
 
-# The robot will start by moving forward, not backward.
+# Robot pauses if front obstacle detected, then resumes.
 
-# BFS logic remains untouched.
+# Map stays open while robot moves.
 
-# Nav2 behaves predictably and aligned to your map.
-
-# You don’t modify Nav2 internals — just send correctly transformed goals.
+# Real-time visual feedback simulates RViz without launching it.
