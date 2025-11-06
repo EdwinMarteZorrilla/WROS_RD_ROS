@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, LaserScan  # <-- Added LaserScan for LiDAR
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
 import time
@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 # ---------------- CONFIG ----------------
 GRID_SIZE = 0.2  # meters per grid cell
 rot_speed = 0.8  # default rotation speed
+FRONT_ANGLE_WINDOW = 15  # degrees to either side
+OBSTACLE_DISTANCE_THRESHOLD = 0.10  # meters
 
 # ---------------- IMU Reader ----------------
 class IMUReader(Node):
@@ -53,6 +55,38 @@ class OdometryReader(Node):
         geographic_yaw = alpha * self.odom_yaw + (1 - alpha) * self.imu_yaw
         self.fused_yaw = math.atan2(math.sin(geographic_yaw + self.map_yaw_offset),
                                     math.cos(geographic_yaw + self.map_yaw_offset))
+
+# ---------------- NEW: LIDAR FRONT FILTER ----------------
+class LidarFilter(Node):
+    """Monitors LiDAR data and triggers replan only if obstacle <10cm in front window"""
+    def __init__(self, topic='/scan'):
+        super().__init__('lidar_filter')
+        self.front_clear = True
+        self.subscription = self.create_subscription(LaserScan, topic, self.scan_callback, 10)
+    
+    def scan_callback(self, msg):
+        # Extract LiDAR scan angles
+        num_points = len(msg.ranges)
+        angles = np.linspace(msg.angle_min, msg.angle_max, num_points)
+        ranges = np.array(msg.ranges)
+
+        # Mask NaN/Inf
+        ranges = np.where(np.isfinite(ranges), ranges, np.inf)
+
+        # Select points in narrow front window (±15°)
+        front_indices = np.where(
+            (angles > -math.radians(FRONT_ANGLE_WINDOW)) &
+            (angles < math.radians(FRONT_ANGLE_WINDOW))
+        )[0]
+
+        front_distances = ranges[front_indices]
+
+        if len(front_distances) > 0 and np.min(front_distances) < OBSTACLE_DISTANCE_THRESHOLD:
+            self.front_clear = False
+            self.get_logger().warn(f"⚠️ Obstacle detected ahead at {np.min(front_distances)*100:.1f} cm — triggering replan")
+            # Here you could call a callback or set a shared flag to trigger BFS/Nav2 replan
+        else:
+            self.front_clear = True
 
 # ---------------- Nav2 Goal Sender ----------------
 class Nav2Client(Node):
@@ -123,9 +157,16 @@ def bfs_path(maze, start, goal):
     return path
 
 # ---------------- Follow Path Using Nav2 ----------------
-def follow_path_nav2(nav2_client, path):
+def follow_path_nav2(nav2_client, path, lidar_node):
     """Send each grid cell as a goal to Nav2"""
     for i in range(1, len(path)):
+        # If obstacle detected, stop and wait
+        if not lidar_node.front_clear:
+            nav2_client.get_logger().info("Pausing navigation due to obstacle...")
+            while not lidar_node.front_clear:
+                rclpy.spin_once(lidar_node, timeout_sec=0.1)
+            nav2_client.get_logger().info("Obstacle cleared, resuming navigation")
+
         cur = path[i-1]
         nxt = path[i]
         dr = nxt[0] - cur[0]
@@ -145,22 +186,21 @@ def follow_path_nav2(nav2_client, path):
             yaw = math.pi
 
         nav2_client.send_goal(x_map, y_map, yaw)
-        # Give Nav2 time to reach the goal
-        time.sleep(1.0)  # wait a bit for Nav2 to start
-        # In a real implementation, you would wait for goal completion feedback
+        time.sleep(1.0)
 
 # ---------------- Main ----------------
 def main():
     rclpy.init()
     nav2_client = Nav2Client()
+    lidar_node = LidarFilter()  # <-- Added LiDAR monitoring node
 
     maze_layout = [
         ["R", "1", "0", "0", "0", "0"],
         ["0", "1", "0", "1", "1", "0"],
-        ["0", "0", "G", "1", "0", "0"],
+        ["0", "0", "0", "1", "0", "0"],
         ["0", "1", "1", "1", "0", "1"],
         ["0", "0", "1", "0", "0", "0"],
-        ["0", "1", "1", "1", "1", "0"]
+        ["G", "1", "1", "1", "1", "0"] 
     ]
 
     maze, start, goal = parse_map(maze_layout)
@@ -173,7 +213,7 @@ def main():
     plt.plot(goal[1], goal[0], "yx")
     plt.pause(0.001)
 
-    follow_path_nav2(nav2_client, path)
+    follow_path_nav2(nav2_client, path, lidar_node)
 
     rclpy.shutdown()
 
