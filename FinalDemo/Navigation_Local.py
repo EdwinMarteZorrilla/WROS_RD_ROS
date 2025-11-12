@@ -1,166 +1,224 @@
 #!/usr/bin/env python3
-import time, subprocess, json, paho.mqtt.client as mqtt
+import rclpy
+from rclpy.node import Node
+from nav2_msgs.action import NavigateToPose
+from rclpy.action import ActionClient
+from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
+from nav_msgs.msg import OccupancyGrid, MapMetaData
+import numpy as np
+import math
+import time
 
-# ---------------- CONFIGURATION ----------------
-BROKERS = ["192.168.0.135", "192.168.149.148"]
-BROKER_PORT = 1883
-TOPIC_FIRE = "alerta/fuego"
-RPI_ID = "FIREVOLX_ROBOT"
+# ======================================================
+# --- USER SETTINGS ---
+# ======================================================
 
-# Script paths
-NAVIGATION_SCRIPT = "NAVIGATION-VIDEO-rotations-orig.py"
-FIRE_FIGHT_SCRIPT = "MQTT-TRANSMITTER-PUMP"
-SERVO_SCRIPT = "PUMP-SERVO"
-SERVO_CAMERA_SCRIPT = "SERVO-CAMERA"
+GRID_RESOLUTION = 0.2   # meters per cell
+WALL_VALUE = 100
+FREE_VALUE = 0
 
-# New scripts for the two added states
-LOCATE_FIRE_SCRIPT = "LOCATE-FIRE"
-TURN_FIRE_SCRIPT = "TURN-FIRE"
+ROBOT_HEADING_DEG = 0.0
+GOAL_HEADING_DEG = 0.0
+
+GRID_LAYOUT = [
+   ["R","0","0","0","0","0","0","0","0","0"],
+   ["0","0","0","0","0","0","0","0","0","0"],
+   ["0","0","0","0","0","0","0","0","0","0"],
+   ["0","0","0","0","0","0","0","0","0","0"],
+   ["0","0","0","0","0","0","0","0","0","0"],
+   ["0","0","0","0","0","0","0","0","0","0"],
+   ["0","0","0","0","0","0","0","0","0","0"],
+   ["0","0","0","0","0","0","0","0","0","0"],
+   ["0","0","0","0","0","0","0","0","0","0"],
+   ["G","0","0","0","0","0","0","0","0","0"]
+]
+
+# ======================================================
+# --- Helper Functions ---
+# ======================================================
+
+def make_occupancy_grid(layout):
+    rows = len(layout)
+    cols = len(layout[0])
+    data = np.zeros((rows + 2, cols + 2), dtype=int)
+    start = goal = None
+
+    # add 1-cell wall boundary
+    data[0, :] = WALL_VALUE
+    data[-1, :] = WALL_VALUE
+    data[:, 0] = WALL_VALUE
+    data[:, -1] = WALL_VALUE
+
+    for r, row in enumerate(layout):
+        for c, val in enumerate(row):
+            rr, cc = r + 1, c + 1
+            if val == "1":
+                data[rr, cc] = WALL_VALUE
+            elif val == "0":
+                data[rr, cc] = FREE_VALUE
+            elif val == "R":
+                start = (rr, cc)
+            elif val == "G":
+                goal = (rr, cc)
+    return data, start, goal
 
 
-class FireFighterRobot:
+def grid_to_map_xy(r, c, rows, cols, resolution):
+    x = c * resolution
+    y = (rows - 1 - r) * resolution
+    return x, y
+
+# ======================================================
+# --- Static Map Publisher (auto-disable if SLAM running) ---
+# ======================================================
+
+class StaticMapPublisher(Node):
+    def __init__(self, grid_data, check_interval=1.0):
+        super().__init__('static_map_publisher')
+        self.publisher = self.create_publisher(OccupancyGrid, '/map', 10)
+        self.grid_data = grid_data
+        self.rows, self.cols = grid_data.shape
+        self.resolution = GRID_RESOLUTION
+        self.origin_x = 0.0
+        self.origin_y = 0.0
+        self.publishing = True
+        self.check_timer = self.create_timer(check_interval, self.check_for_external_map)
+        self.pub_timer = self.create_timer(1.0, self.publish_map)
+
+    def check_for_external_map(self):
+        topics = [t[0] for t in self.get_topic_names_and_types()]
+        # If /map already exists, disable static map publisher
+        if '/map' in topics and self.publishing:
+            self.get_logger().info("🔍 Detected external /map topic — disabling static map publisher.")
+            self.publishing = False
+
+    def publish_map(self):
+        if not self.publishing:
+            return
+        msg = OccupancyGrid()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+        msg.info = MapMetaData()
+        msg.info.resolution = self.resolution
+        msg.info.width = self.cols
+        msg.info.height = self.rows
+        msg.info.origin.position.x = self.origin_x
+        msg.info.origin.position.y = self.origin_y
+        msg.info.origin.orientation.w = 1.0
+        flipped = np.flipud(self.grid_data)
+        msg.data = flipped.flatten().tolist()
+        self.publisher.publish(msg)
+        self.get_logger().info_once("✅ Publishing static /map to Nav2.")
+
+# ======================================================
+# --- Initial Pose Publisher ---
+# ======================================================
+
+class InitialPosePublisher(Node):
     def __init__(self):
-        self.state = "IDLE"
-        self.fire_detected = True
-        self.last_rpi = None
+        super().__init__('initial_pose_publisher')
+        self.pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
 
-        # MQTT setup
-        self.mqtt_clients = []
-        for ip in BROKERS:
-            client = mqtt.Client()
-            client.on_connect = self.on_connect
-            client.on_message = self.on_message
-            try:
-                client.connect(ip, BROKER_PORT, 60)
-                client.loop_start()
-                print(f"[MQTT] ✅ Connected to broker {ip}")
-            except Exception as e:
-                print(f"[MQTT] ⚠️ Could not connect to {ip}: {e}")
-            self.mqtt_clients.append(client)
+    def set_pose(self, x, y, yaw_deg, wait_for_map=True, timeout_sec=5.0):
+        if wait_for_map:
+            start = self.get_clock().now().seconds_nanoseconds()[0]
+            while rclpy.ok():
+                topics = [t[0] for t in self.get_topic_names_and_types()]
+                if '/map' in topics:
+                    break
+                now = self.get_clock().now().seconds_nanoseconds()[0]
+                if (now - start) > timeout_sec:
+                    self.get_logger().warning("⏱ Timeout waiting for /map; publishing initialpose anyway.")
+                    break
+                time.sleep(0.1)
 
-    # ---------------- MQTT ----------------
-    def on_connect(self, client, userdata, flags, rc):
-        client.subscribe(TOPIC_FIRE)
-        print(f"[MQTT] Subscribed to {TOPIC_FIRE}")
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        yaw = math.radians(yaw_deg)
+        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
-    def on_message(self, client, userdata, msg):
-        try:
-            payload = json.loads(msg.payload.decode())
-            label = payload.get("label", "").lower()
-            rpi_id = payload.get("rpi_id", "UNKNOWN")
+        cov = [0.0]*36
+        cov[0] = 0.25   # var(x)
+        cov[7] = 0.25   # var(y)
+        cov[35] = math.radians(20.0)**2  # var(yaw)
+        msg.pose.covariance = cov
 
-            if msg.topic == TOPIC_FIRE and label in ["fire", "cigar", "fireball"]:
-                print(f"[MQTT] 🔥 Fire signal detected from {rpi_id}: {label}")
-                self.fire_detected = True
-                self.last_rpi = rpi_id
+        self.pub.publish(msg)
+        self.get_logger().info(f"📍 Initial pose set to ({x:.2f}, {y:.2f}), yaw={yaw_deg:.1f}°")
 
-        except Exception as e:
-            print(f"[MQTT] ❌ Error processing message: {e}")
+# ======================================================
+# --- Nav2 Client ---
+# ======================================================
 
-    # ---------------- STATE MACHINE ----------------
-    def run(self):
-        while True:
-            if self.state == "IDLE":
-                print("[STATE] 💤 IDLE → waiting for fire alert...")
-                if self.fire_detected:
-                    print("[STATE] 🚀 Switching to NAVIGATION")
-                    self.state = "NAVIGATION"
+class Nav2Client(Node):
+    def __init__(self):
+        super().__init__('nav2_client')
+        self.client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.stop_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
-            elif self.state == "NAVIGATION":
-                self.navigation_state()
-                self.state = "LOCATE_FIRE"
+    def send_goal(self, x, y, yaw_deg=0.0):
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = x
+        goal_msg.pose.pose.position.y = y
+        yaw = math.radians(yaw_deg)
+        goal_msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal_msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        self.get_logger().info(f"🎯 Sending goal → ({x:.2f}, {y:.2f}), yaw={yaw_deg:.1f}°")
 
-            elif self.state == "LOCATE_FIRE":
-                self.locate_fire_state()
-                self.state = "TURN_FIRE"
+        self.client.wait_for_server()
+        future = self.client.send_goal_async(goal_msg)
+        future.add_done_callback(self.goal_done_callback)
 
-            elif self.state == "TURN_FIRE":
-                self.turn_fire_state()
-                self.state = "FIRE_FIGHTING"
+    def goal_done_callback(self, future):
+        self.get_logger().info("✅ Navigation goal completed. Stopping robot.")
+        stop_msg = Twist()
+        self.stop_pub.publish(stop_msg)
+        self.get_logger().info("🛑 Robot stopped — holding final heading.")
 
-            elif self.state == "FIRE_FIGHTING":
-                self.fire_fighting_state()
-                self.state = "SEARCH"
+# ======================================================
+# --- MAIN ---
+# ======================================================
 
-            elif self.state == "SEARCH":
-                self.search_state()
-                self.state = "RETURN_NAVIGATION"
+def main():
+    rclpy.init()
 
-            elif self.state == "RETURN_NAVIGATION":
-                self.return_navigation_state()
-                self.state = "DONE"
+    grid_data, start_idx, goal_idx = make_occupancy_grid(GRID_LAYOUT)
+    if start_idx is None or goal_idx is None:
+        print("❌ Grid must contain 'R' and 'G'")
+        return
 
-            elif self.state == "DONE":
-                self.done_state()
-                self.state = "IDLE"
+    map_pub = StaticMapPublisher(grid_data)
+    pose_pub = InitialPosePublisher()
+    nav2_client = Nav2Client()
 
-            time.sleep(0.2)
+    rows, cols = grid_data.shape
+    start_x, start_y = grid_to_map_xy(start_idx[0], start_idx[1], rows, cols, GRID_RESOLUTION)
+    goal_x, goal_y = grid_to_map_xy(goal_idx[0], goal_idx[1], rows, cols, GRID_RESOLUTION)
 
-    # ---------------- STATE DEFINITIONS ----------------
+    print(f"\nStart grid: {start_idx} → map ({start_x:.2f}, {start_y:.2f})")
+    print(f"Goal  grid: {goal_idx} → map ({goal_x:.2f}, {goal_y:.2f})")
+    print(f"Robot heading: {ROBOT_HEADING_DEG}°, Goal heading: {GOAL_HEADING_DEG}°\n")
 
-    def navigation_state(self):
-        try:
-            print("[STATE] 🧭 NAVIGATION: Moving toward fire zone...")
-            subprocess.run(
-                ["python3", NAVIGATION_SCRIPT, str(self.last_rpi)],
-                check=True
-            )
-        except Exception as e:
-            print(f"[ERROR] ❌ NAVIGATION: {e}")
+    time.sleep(2.0)  # allow Nav2/SLAM startup
 
-    def locate_fire_state(self):
-        print("[STATE] 🔍 LOCATE_FIRE: Scanning area for flame position...")
-        try:
-            subprocess.run(["python3", LOCATE_FIRE_SCRIPT], check=True)
-            print("[ACTION] ✅ Fire located.")
-        except Exception as e:
-            print(f"[ERROR] ❌ LOCATE_FIRE: {e}")
+    # Publish initial pose (waits for /map if needed)
+    pose_pub.set_pose(start_x, start_y, ROBOT_HEADING_DEG, wait_for_map=True, timeout_sec=8.0)
 
-    def turn_fire_state(self):
-        print("[STATE] 🔄 TURN_FIRE: Orienting robot toward fire.")
-        try:
-            subprocess.run(["python3", TURN_FIRE_SCRIPT], check=True)
-            print("[ACTION] ✅ Robot turned toward fire.")
-        except Exception as e:
-            print(f"[ERROR] ❌ TURN_FIRE: {e}")
+    # Send goal
+    nav2_client.send_goal(goal_x, goal_y, GOAL_HEADING_DEG)
 
-    def fire_fighting_state(self):
-        print("[STATE] 💦 FIRE_FIGHTING: Activating pump and servo.")
-        try:
-            pump = subprocess.Popen(["python3", FIRE_FIGHT_SCRIPT])
-            servo = subprocess.Popen(["python3", SERVO_SCRIPT])
-            time.sleep(6)
-            pump.terminate()
-            servo.terminate()
-            print("[ACTION] ✅ Fire extinguishing completed.")
-        except Exception as e:
-            print(f"[ERROR] ❌ FIRE_FIGHTING: {e}")
+    # Spin
+    while rclpy.ok():
+        rclpy.spin_once(map_pub, timeout_sec=0.1)
+        rclpy.spin_once(nav2_client, timeout_sec=0.1)
 
-    def search_state(self):
-        try:
-            print("[STATE] 🎥 SEARCH: Moving servo camera.")
-            servo_process = subprocess.Popen(["python3", SERVO_CAMERA_SCRIPT])
-            time.sleep(10)
-            servo_process.terminate()
-            print("[SEARCH] ✅ Servo camera movement finished.")
-        except Exception as e:
-            print(f"[ERROR] ❌ SEARCH: {e}")
+    rclpy.shutdown()
 
-    def return_navigation_state(self):
-        print("[STATE] 🏁 RETURN_NAVIGATION: Returning to origin.")
-        try:
-            subprocess.run(
-                ["python3", NAVIGATION_SCRIPT, str(self.last_rpi)],
-                check=True
-            )
-        except Exception as e:
-            print(f"[ERROR] ❌ RETURN_NAVIGATION: {e}")
-
-    def done_state(self):
-        print("[STATE] 🔄 DONE: Resetting to IDLE.")
-        self.fire_detected = False
-        self.last_rpi = None
-
-
-if __name__ == "__main__":
-    FireFighterRobot().run()
+if __name__ == '__main__':
+    main()
