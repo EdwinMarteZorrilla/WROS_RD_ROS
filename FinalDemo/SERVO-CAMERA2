@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+import json
+import rclpy
+from rclpy.node import Node
+from ros_robot_controller_msgs.msg import SetPWMServoState, PWMServoState
+import paho.mqtt.client as mqtt
+from time import time, sleep
+
+class DualServoController(Node):
+    def __init__(self):
+        super().__init__('dual_servo_controller')
+
+        # -----------------------
+        # SERVO CONFIG (kept from your correct file)
+        # -----------------------
+        # Vertical servo (Camera tilt)
+        self.servo_vertical_id = 1
+        self.VERTICAL_START_DOWN = 1200     # initial lower pose
+        self.VERTICAL_FINAL_VIEW = 1300     # hold here after start
+        self.vertical_position = float(self.VERTICAL_FINAL_VIEW)
+
+        # Horizontal servo (camera rotation)
+        self.servo_horizontal_id = 2
+        self.HORIZONTAL_SWEEP_LEFT = 1050
+        self.HORIZONTAL_SWEEP_RIGHT = 1950
+        # starting horizontal
+        self.horizontal_position = 1700
+
+        # Smoothing and timer
+        self.smooth_step = 4.5
+        self.timer_period = 0.02
+
+        # scan direction
+        self.horizontal_moving_left = False
+
+        # follow mode flags
+        self.follow_mode = False
+        self.last_detection_time = 0.0
+        self.follow_timeout = 0.5  # seconds to wait before resuming scan
+
+        # Vertical follow adjustment span (how many PWM units from neutral)
+        # You can tune this; 150 gives moderate vertical movement
+        self.VERTICAL_FOLLOW_SPAN = 150.0
+
+        # Publisher
+        self.publisher = self.create_publisher(
+            SetPWMServoState,
+            "/ros_robot_controller/pwm_servo/set_state",
+            10
+        )
+
+        # MQTT client
+        self.mqtt_client = mqtt.Client()
+        self.mqtt_client.on_connect = self._on_mqtt_connect
+        self.mqtt_client.on_message = self._on_mqtt_message
+        self.mqtt_client.connect("localhost", 1883, 60)
+        self.mqtt_client.loop_start()
+
+        # Timer loop
+        self.timer = self.create_timer(self.timer_period, self.timer_callback)
+        self.start_time = time()
+
+        self.get_logger().info("Dual camera servo controller running (SCAN mode).")
+
+    # ---------------- servo sender ----------------
+    def send_servo(self, servo_id, position):
+        msg = SetPWMServoState()
+        state = PWMServoState()
+        state.id = [servo_id]
+        state.position = [int(round(position))]
+        state.offset = [0]
+        msg.state.append(state)
+        self.publisher.publish(msg)
+
+    # ---------------- MQTT callbacks ----------------
+    def _on_mqtt_connect(self, client, userdata, flags, rc):
+        self.get_logger().info(f"MQTT connected ({rc}) - servo controller subscribing to edgeimpulse/alert")
+        client.subscribe("edgeimpulse/alert")
+
+    def _on_mqtt_message(self, client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode())
+            detections = payload.get("detections", [])
+            if not detections:
+                return
+
+            d = detections[0]
+            cx = d.get("x", 0) + d.get("width", 0) / 2.0
+            cy = d.get("y", 0) + d.get("height", 0) / 2.0
+
+            # normalize using 640x480
+            norm_x = max(0.0, min(1.0, cx / 640.0))
+            norm_y = max(0.0, min(1.0, cy / 480.0))
+
+            # map normalized coords to PWM targets
+            # horizontal: left->right mapping
+            target_h = self.HORIZONTAL_SWEEP_LEFT + norm_x * (self.HORIZONTAL_SWEEP_RIGHT - self.HORIZONTAL_SWEEP_LEFT)
+
+            # vertical: map around FINAL_VIEW; invert y so larger y (lower in image) moves camera down
+            # center_y = 0.5 -> vertical = FINAL_VIEW
+            target_v = self.VERTICAL_FINAL_VIEW + (0.5 - norm_y) * self.VERTICAL_FOLLOW_SPAN
+
+            # clamp targets to safe PWM range
+            target_h = max(self.HORIZONTAL_SWEEP_LEFT, min(self.HORIZONTAL_SWEEP_RIGHT, target_h))
+            # assume safe vertical range 1000..2000
+            target_v = max(1000.0, min(2000.0, target_v))
+
+            # set follow targets
+            self.follow_mode = True
+            self.last_detection_time = time()
+
+            # store targets for timer step smoothing
+            self.target_horizontal = float(target_h)
+            self.target_vertical = float(target_v)
+
+            self.get_logger().info(f"FOLLOW: norm_x={norm_x:.3f} norm_y={norm_y:.3f} -> target_h={int(target_h)} target_v={int(target_v)}")
+
+        except Exception as e:
+            self.get_logger().warn(f"MQTT parse error in servo controller: {e}")
+
+    # ---------------- main timer ----------------
+    def timer_callback(self):
+        runtime = time() - self.start_time
+        now = time()
+
+        # ---------------------------
+        # ALWAYS initialize safe targets
+        # ---------------------------
+        target_h = self.horizontal_position
+        target_v = self.vertical_position
+
+        # VERTICAL motion: one-time move to FINAL_VIEW after start, then follow if active
+        if runtime < 1.5 and not self.follow_mode:
+            target_v = self.VERTICAL_START_DOWN
+        elif not self.follow_mode:
+            target_v = self.VERTICAL_FINAL_VIEW
+        else:
+            # follow mode active -> use stored target (if missing, keep current)
+            target_v = getattr(self, "target_vertical", self.VERTICAL_FINAL_VIEW)
+
+        # HORIZONTAL: either scanning or following
+        if self.follow_mode:
+            # if follow timed out, exit follow mode but set a valid scan target
+            if (now - self.last_detection_time) > self.follow_timeout:
+                self.follow_mode = False
+                self.get_logger().info("FOLLOW timed out -> resuming SCAN")
+                # set target_h to the current sweep endpoint so the code continues safely
+                target_h = self.HORIZONTAL_SWEEP_LEFT if self.horizontal_moving_left else self.HORIZONTAL_SWEEP_RIGHT
+            else:
+                # use follow target if available
+                target_h = getattr(self, "target_horizontal", self.horizontal_position)
+        else:
+            # scanning behavior (original)
+            target_h = self.HORIZONTAL_SWEEP_LEFT if self.horizontal_moving_left else self.HORIZONTAL_SWEEP_RIGHT
+
+        # Smooth vertical
+        diff_v = target_v - self.vertical_position
+        if abs(diff_v) > self.smooth_step:
+            self.vertical_position += self.smooth_step if diff_v > 0 else -self.smooth_step
+        else:
+            self.vertical_position = target_v
+
+        # Smooth horizontal
+        diff_h = target_h - self.horizontal_position
+        if abs(diff_h) > self.smooth_step:
+            self.horizontal_position += self.smooth_step if diff_h > 0 else -self.smooth_step
+        else:
+            self.horizontal_position = target_h
+            if not self.follow_mode:
+                # toggle sweep direction when reached endpoint
+                self.horizontal_moving_left = not self.horizontal_moving_left
+
+        # Send servo commands
+        self.send_servo(self.servo_vertical_id, self.vertical_position)
+        self.send_servo(self.servo_horizontal_id, self.horizontal_position)
+
+    # ---------------- shutdown helper ----------------
+    def return_to_neutral(self):
+        self.get_logger().info("Returning servos to neutral positions...")
+        # vertical -> FINAL_VIEW, horizontal -> 1500
+        while (
+            abs(self.vertical_position - self.VERTICAL_FINAL_VIEW) > self.smooth_step or
+            abs(self.horizontal_position - 1500) > self.smooth_step
+        ):
+            if abs(self.vertical_position - self.VERTICAL_FINAL_VIEW) > self.smooth_step:
+                step = self.smooth_step if self.VERTICAL_FINAL_VIEW > self.vertical_position else -self.smooth_step
+                self.vertical_position += step
+                self.send_servo(self.servo_vertical_id, self.vertical_position)
+
+            if abs(self.horizontal_position - 1500) > self.smooth_step:
+                step = self.smooth_step if 1500 > self.horizontal_position else -self.smooth_step
+                self.horizontal_position += step
+                self.send_servo(self.servo_horizontal_id, self.horizontal_position)
+
+            sleep(self.timer_period)
+
+        self.send_servo(self.servo_vertical_id, self.VERTICAL_FINAL_VIEW)
+        self.send_servo(self.servo_horizontal_id, 1500)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DualServoController()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("Interrupted by user.")
+        node.return_to_neutral()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
