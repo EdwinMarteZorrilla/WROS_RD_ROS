@@ -6,6 +6,7 @@ from geometry_msgs.msg import Twist
 import paho.mqtt.client as mqtt
 import math
 from rclpy.executors import MultiThreadedExecutor
+import json
 
 # ==========================================================
 # --- Robot Auto-Centering Node (Improved) ---
@@ -46,20 +47,31 @@ class ObjectCentering(Node):
 
     def on_mqtt_message(self, client, userdata, msg):
         try:
-            x_str, y_str = msg.payload.decode().split(",")
-            x_val = float(x_str)
-            y_val = float(y_str)
+            payload = json.loads(msg.payload.decode())
+            detections = payload.get("detections", [])
 
-            # Normalize 96x96 pixel detections
-            if x_val > 1.0 or y_val > 1.0:
-                x_val /= 96.0
-                y_val /= 96.0
+            if len(detections) == 0:
+                self.get_logger().warn("⚠️ No detections found in MQTT message")
+                return
 
+            det = detections[0]  # just use the first detection for now
+            x_val = float(det.get("x", 0))
+            y_val = float(det.get("y", 0))
+
+            # Normalize from 96x96 model size
+            x_val /= 96.0
+            y_val /= 96.0
+
+            # Clamp to [0,1]
             self.object_x = max(0.0, min(1.0, x_val))
             self.object_y = max(0.0, min(1.0, y_val))
 
+            self.get_logger().info(f"📡 Object at normalized: x={self.object_x:.2f}, y={self.object_y:.2f}")
+
+        except json.JSONDecodeError:
+            self.get_logger().warn("⚠️ Invalid MQTT message: not valid JSON")
         except Exception as e:
-            self.get_logger().warn(f"⚠️ Invalid MQTT message: {e}")
+            self.get_logger().warn(f"⚠️ Error parsing MQTT message: {e}")
 
     def update_motion(self):
         if self.cmd_node is None:
