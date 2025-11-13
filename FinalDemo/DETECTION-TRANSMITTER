@@ -1,0 +1,133 @@
+  GNU nano 7.2                                                                                                                                                                                                                                                                                                                                                                                                                                                                            DETECTION                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     
+#!/usr/bin/env python3
+import subprocess
+import json
+import os
+import sys
+import threading
+import paho.mqtt.client as mqtt
+
+BROKER_IP = "127.0.0.1"
+BROKER_PORT = 1883
+
+MQTT_TOPIC_COMMAND = "edgeimpulse/command"
+MQTT_TOPIC_ALERT = "edgeimpulse/alert"
+
+runner_path = "/usr/local/bin/edge-impulse-linux-runner"
+model_path = "/home/pi/cigartwo-linux-aarch64-v73.eim"
+
+DESIRED_LABELS = {"fireball"}#x
+THRESHOLD = 0.01
+RPI_ID = "RPI_RECEIVER"
+
+if not os.path.exists(model_path):
+    print(f"[receiver] ERROR: Missing model: {model_path}")
+    sys.exit(1)
+
+client = mqtt.Client()
+processing_enabled = False
+
+# -------------------------------------------------------
+# READ EDGE IMPULSE RUNNER OUTPUT
+# ----------x---------------------------------------------
+def read_runner_output(proc):
+    global processing_enabled
+
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            continue
+
+        line = line.strip()
+        print("[runner]", line, flush=True)
+
+        if not processing_enabled:
+            continue
+
+        if "boundingBoxes" not in line:
+            continue
+
+        try:
+            json_start = line.index("[")
+            boxes = json.loads(line[json_start:])
+        except Exception as e:
+            print("[receiver] JSON ERROR:", e)
+            continue
+
+        trigger = False
+        for b in boxes:
+            if b.get("label") in DESIRED_LABELS and float(b.get("value", 0)) >= THRESHOLD:
+                trigger = True
+
+        if trigger:
+            payload = {
+                "rpi_id": RPI_ID,
+                "detections": boxes
+            }
+
+            client.publish(MQTT_TOPIC_ALERT, json.dumps(payload))
+            print("[receiver] DETECTION SENT →", payload, flush=True)
+
+
+# -------------------------------------------------------
+# MQTT CALLBACKS
+# -------------------------------------------------------
+def on_connect(client, userdata, flags, rc):
+    print(f"[receiver] MQTT Connected ({rc})")
+    client.subscribe(MQTT_TOPIC_COMMAND)
+
+
+def on_message(client, userdata, msg):
+    global processing_enabled
+
+    try:
+        payload = json.loads(msg.payload.decode())
+        cmd = payload.get("command", "")
+
+        if cmd == "start_edge_impulse":
+            print("[receiver] START requested")
+            processing_enabled = True
+
+        elif cmd == "stop_edge_impulse":
+            print("[receiver] STOP requested")
+            processing_enabled = False
+
+        elif cmd == "reset":
+            print("[receiver] RESET received (future use)")
+
+    except Exception as e:
+        print("[receiver] Invalid MQTT:", e)
+
+
+# -------------------------------------------------------
+# MAIN
+# -------------------------------------------------------
+client.on_connect = on_connect
+client.on_message = on_message
+client.connect(BROKER_IP, BROKER_PORT, 60)
+client.loop_start()
+
+print("[receiver] Starting Edge Impulse runner...")
+proc = subprocess.Popen(
+    [runner_path, "--model-file", model_path, "--clean"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    bufsize=1,
+    text=True,
+)
+
+threading.Thread(target=read_runner_output, args=(proc,), daemon=True).start()
+
+print("[receiver] READY. Waiting for MQTT commands.")
+
+while True:
+    pass
+
+
+
+
+
+
+
+
+
