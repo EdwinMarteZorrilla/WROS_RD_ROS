@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+X#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
@@ -47,11 +47,13 @@ class ObjectCentering(Node):
     # ======================================================
     def on_mqtt_connect(self, client, userdata, flags, rc):
         self.get_logger().info("✅ Connected to MQTT broker")
-        client.subscribe("object/coordinates")  # topic publishing "x,y"
+        client.subscribe("edgeimpulse/alert")  # topic publishing "x,y"
 
     def on_mqtt_message(self, client, userdata, msg):
         try:
             x_str, y_str = msg.payload.decode().split(",")
+            print("x_val:", x_val)
+            print("y_val:", y_val)
             x_val = float(x_str)
             y_val = float(y_str)
 
