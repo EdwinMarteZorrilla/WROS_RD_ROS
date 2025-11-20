@@ -23,11 +23,11 @@ class ObjectCentering(Node):
         # tracking
         self.low_threshold = 0.02        # ignore tiny errors
         self.high_threshold = 0.07       # must exceed this to move
-        self.rotation_gain = 1.2         # rotation multiplier
+        self.rotation_gain = 2        # rotation multiplier
         self.smoothing = 0.25            # 0.1–0.3 recommended
 
         # motor protections
-        self.min_start_speed = 0.22      # torque to overcome friction
+        self.min_start_speed = 0.95      # torque to overcome friction
         self.max_speed = 1.0             # cap rotation
         # self.pulse_time = 0.20           # duration of rotation burst
         # self.cooldown_after_pulses = 10  # pulses before cooling break
