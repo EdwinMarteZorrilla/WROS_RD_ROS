@@ -43,7 +43,7 @@ class ObjectCentering(Node):
 
     def on_mqtt_connect(self, client, userdata, flags, rc):
         self.get_logger().info("✅ Connected to MQTT broker")
-        client.subscribe("object/coordinates")
+        client.subscribe("edgeimpulse/alert")
 
     def on_mqtt_message(self, client, userdata, msg):
         try:

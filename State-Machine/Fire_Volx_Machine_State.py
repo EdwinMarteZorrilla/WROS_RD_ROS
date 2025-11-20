@@ -2,7 +2,7 @@
 import time, subprocess, json, paho.mqtt.client as mqtt
 
 # ---------------- CONFIGURATION ----------------
-BROKERS = ["192.168.0.135", "192.168.149.148"]
+BROKERS = ["192.168.86.43", "192.168.149.148"]
 BROKER_PORT = 1883
 TOPIC_FIRE = "alerta/fuego"
 RPI_ID = "FIREVOLX_ROBOT"
