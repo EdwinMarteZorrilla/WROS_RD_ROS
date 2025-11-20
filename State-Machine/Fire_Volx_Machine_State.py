@@ -8,14 +8,14 @@ TOPIC_FIRE = "alerta/fuego"
 RPI_ID = "FIREVOLX_ROBOT"
 
 # Script paths
-NAVIGATION_SCRIPT = "NAVIGATION-VIDEO-rotations-orig.py"
+NAVIGATION_SCRIPT = "Navigation_Full_Nav2-C.py"
 FIRE_FIGHT_SCRIPT = "MQTT-TRANSMITTER-PUMP"
 SERVO_SCRIPT = "PUMP-SERVO"
 SERVO_CAMERA_SCRIPT = "SERVO-CAMERA"
 
 # New scripts for the two added states
-LOCATE_FIRE_SCRIPT = "LOCATE-FIRE"
-TURN_FIRE_SCRIPT = "TURN-FIRE"
+LOCATE_FIRE_SCRIPT = "Center_Camera_Fix.py"
+TURN_FIRE_SCRIPT = "Get_Closer.py"
 
 
 class FireFighterRobot:
@@ -49,7 +49,7 @@ class FireFighterRobot:
             label = payload.get("label", "").lower()
             rpi_id = payload.get("rpi_id", "UNKNOWN")
 
-            if msg.topic == TOPIC_FIRE and label in ["fire", "cigar", "fireball"]:
+            if msg.topic == TOPIC_FIRE and label in ["red_lid", "person_smoking"]:
                 print(f"[MQTT] 🔥 Fire signal detected from {rpi_id}: {label}")
                 self.fire_detected = True
                 self.last_rpi = rpi_id
