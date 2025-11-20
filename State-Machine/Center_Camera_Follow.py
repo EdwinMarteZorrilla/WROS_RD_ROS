@@ -29,9 +29,9 @@ class ObjectCentering(Node):
         # motor protections
         self.min_start_speed = 0.22      # torque to overcome friction
         self.max_speed = 1.0             # cap rotation
-        self.pulse_time = 0.20           # duration of rotation burst
-        self.cooldown_after_pulses = 10  # pulses before cooling break
-        self.cooldown_time = 0.8         # seconds to rest motors
+        # self.pulse_time = 0.20           # duration of rotation burst
+        # self.cooldown_after_pulses = 10  # pulses before cooling break
+        # self.cooldown_time = 0.8         # seconds to rest motors
 
         # --------------------------------------------
         # INTERNAL STATE
@@ -39,11 +39,11 @@ class ObjectCentering(Node):
         self.object_x = 0.5
         self.filtered_x = 0.5
 
-        self.is_pulsing = False
-        self.pulse_end_time = 0.0
+        # self.is_pulsing = False
+        # # self.pulse_end_time = 0.0
 
-        self.pulse_count = 0
-        self.cooldown_until = 0.0
+        # # self.pulse_count = 0
+        # self.cooldown_until = 0.0
 
         # MQTT setup
         self.mqtt_client = mqtt.Client()
@@ -90,69 +90,116 @@ class ObjectCentering(Node):
     # --------------------------------------------
     # CONTROL LOOP
     # --------------------------------------------
+    
+    
     def update_motion(self):
         if self.cmd_node is None:
             return
 
-        now = self.get_clock().now().nanoseconds / 1e9
         error = self.filtered_x - 0.5
-
+        abs_error = abs(error)
+        
         # ----------------------------------------
-        # 1. Currently pulsing → check if done
+        # 1. Deadband/Stop Logic
         # ----------------------------------------
-        if self.is_pulsing:
-            if now >= self.pulse_end_time:
-                self.cmd_node.stop_rotation()
-                self.is_pulsing = False
+        # Stop the robot if the error is within the deadband
+        if abs_error < self.high_threshold:
+            self.cmd_node.stop_rotation() # <-- Now we stop if we're centered
             return
+        
+        # ----------------------------------------
+        # 2. Compute speed from error (P-Control)
+        # ----------------------------------------
+        speed_raw = -error * self.rotation_gain   # Base speed
+        speed = speed_raw
 
         # ----------------------------------------
-        # 2. Motor cooldown
+        # 3. Apply Minimum Torque (0.95)
         # ----------------------------------------
-        if now < self.cooldown_until:
-            return
-
+        # If the calculated speed is non-zero, but too low to move (below 0.95)
+        if abs_error > self.low_threshold and abs(speed_raw) < self.min_start_speed:
+            # Set speed to the minimum required torque (0.95)
+            speed = self.min_start_speed * (1 if speed_raw > 0 else -1)
+        
         # ----------------------------------------
-        # 3. Deadband: ignore tiny errors
+        # 4. Cap max speed (1.0)
         # ----------------------------------------
-        if abs(error) < self.low_threshold:
-            return
-
-        # ----------------------------------------
-        # 4. Only act if error is significant
-        # ----------------------------------------
-        if abs(error) < self.high_threshold:
-            return
-
-        # ----------------------------------------
-        # 5. Compute speed from error
-        # ----------------------------------------
-        speed = -error * self.rotation_gain   # invert if needed
-
-        # minimum torque (fix right-turn problem)
-        if abs(speed) < self.min_start_speed:
-            speed = self.min_start_speed * (1 if speed > 0 else -1)
-
-        # cap max speed
         speed = max(-self.max_speed, min(self.max_speed, speed))
 
         # ----------------------------------------
-        # 6. Fire a short pulse
+        # 5. Publish continuous speed
         # ----------------------------------------
         self.cmd_node.publish_rotation(speed)
-        self.is_pulsing = True
-        self.pulse_end_time = now + self.pulse_time
-
-        self.pulse_count += 1
-
-        # if many pulses → cooldown
-        if self.pulse_count >= self.cooldown_after_pulses:
-            self.cooldown_until = now + self.cooldown_time
-            self.pulse_count = 0
 
         self.get_logger().info(
-            f"Pulse: error={error:.2f}, speed={speed:.2f}"
+            f"Continuous: error={error:.2f}, speed={speed:.2f}"
         )
+        
+        
+        
+    # def update_motion(self):
+        # if self.cmd_node is None:
+            # return
+
+        # now = self.get_clock().now().nanoseconds / 1e9
+        # error = self.filtered_x - 0.5
+
+        # # ----------------------------------------
+        # # 1. Currently pulsing → check if done
+        # # ----------------------------------------
+        # if self.is_pulsing:
+            # if now >= self.pulse_end_time:
+                # self.cmd_node.stop_rotation()
+                # self.is_pulsing = False
+            # return
+
+        # # ----------------------------------------
+        # # 2. Motor cooldown
+        # # ----------------------------------------
+        # if now < self.cooldown_until:
+            # return
+
+        # # ----------------------------------------
+        # # 3. Deadband: ignore tiny errors
+        # # ----------------------------------------
+        # if abs(error) < self.low_threshold:
+            # return
+
+        # # ----------------------------------------
+        # # 4. Only act if error is significant
+        # # ----------------------------------------
+        # if abs(error) < self.high_threshold:
+            # return
+
+        # # ----------------------------------------
+        # # 5. Compute speed from error
+        # # ----------------------------------------
+        # speed = -error * self.rotation_gain   # invert if needed
+
+        # # minimum torque (fix right-turn problem)
+        # if abs(speed) < self.min_start_speed:
+            # speed = self.min_start_speed * (1 if speed > 0 else -1)
+
+        # # cap max speed
+        # speed = max(-self.max_speed, min(self.max_speed, speed))
+
+        # # ----------------------------------------
+        # # 6. Fire a short pulse
+        # # ----------------------------------------
+        # self.cmd_node.publish_rotation(speed)
+        # self.is_pulsing = True
+        # self.pulse_end_time = now + self.pulse_time
+
+        # self.pulse_count += 1
+
+        # # if many pulses → cooldown
+        # if self.pulse_count >= self.cooldown_after_pulses:
+            # self.cooldown_until = now + self.cooldown_time
+            # self.pulse_count = 0
+
+        # self.get_logger().info(
+            # f"Pulse: error={error:.2f}, speed={speed:.2f}"
+        # )
 
 
 # ==========================================================
