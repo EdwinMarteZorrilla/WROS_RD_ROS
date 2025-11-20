@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+import time, subprocess, json, paho.mqtt.client as mqtt
+
+# ---------------- CONFIGURACIÓN ----------------
+BROKERS = ["192.168.149.171", "192.168.149.148"]
+BROKER_PORT = 1883
+TOPIC_FIRE = "alerta/fuego"
+TOPIC_EDGE_COMMAND = "edgeimpulse/command"
+TOPIC_EDGE_ALERT = "edgeimpulse/alert"
+RPI_ID = "FIREVOLX_ROBOT"
+
+# Rutas a scripts
+NAVIGATION_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/NAVIGATION-STARTX"
+RETURN_NAVIGATION_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/NAVIGATION-FINAL"
+FIRE_FIGHT_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/MQTT-TRANSMITTER-PUMP"
+SERVO_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/PUMP-SERVO"
+SERVO_CAMERA_SCRIPT = "/home/ubuntu/firevolx_ws/src/firevolx/firevolx/SERVO-CAMERA"
+
+
+class FireFighterRobot:
+    def __init__(self):
+        self.state = "IDLE"
+        self.fire_detected = False
+        self.edge_confirmation = False
+        self.last_rpi = None
+
+        # Configurar MQTT
+        self.mqtt_clients = []
+        for ip in BROKERS:
+            client = mqtt.Client()
+            client.on_connect = self.on_connect
+            client.on_message = self.on_message
+            try:
+                client.connect(ip, BROKER_PORT, 60)
+                client.loop_start()
+                print(f"[MQTT] ✅ Conectado a broker {ip}")
+            except Exception as e:
+                print(f"[MQTT] ⚠️ No se pudo conectar a {ip}: {e}")
+            self.mqtt_clients.append(client)
+
+    # --- MQTT ---
+    def on_connect(self, client, userdata, flags, rc):
+        client.subscribe(TOPIC_FIRE)
+        client.subscribe(TOPIC_EDGE_ALERT)
+        print(f"[MQTT] Subscrito a {TOPIC_FIRE} y {TOPIC_EDGE_ALERT}")
+
+    def on_message(self, client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode())
+            label = payload.get("label", "").lower()
+            rpi_id = payload.get("rpi_id", "UNKNOWN")
+
+            if msg.topic == TOPIC_FIRE and label in ["fire", "cigar", "fireball"]:
+                print(f"[MQTT] 🔥 Señal inicial detectada desde {rpi_id}: {label}")
+                self.fire_detected = True
+                self.last_rpi = rpi_id
+
+            elif msg.topic == TOPIC_EDGE_ALERT and label in ["fire", "cigar"]:
+                confidence = float(payload.get("confidence", 0))
+                print(f"[MQTT] 🔎 Confirmación FIRE de {rpi_id} con confianza {confidence}")
+                if confidence >= 0.7:
+                    self.edge_confirmation = True
+
+        except Exception as e:
+            print(f"[MQTT] ❌ Error procesando mensaje: {e}")
+
+    # --- STATE MACHINE ---
+    def run(self):
+        while True:
+            if self.state == "IDLE" and self.fire_detected:
+                print("[STATE] 🚀 Cambiando a NAVIGATION")
+                self.state = "NAVIGATION"
+
+            elif self.state == "NAVIGATION":
+                self.navigation_state()
+                self.state = "FIRE_FIGHTING"
+
+            elif self.state == "FIRE_FIGHTING":
+                self.fire_fighting_state()
+                self.state = "SEARCH"
+
+            elif self.state == "SEARCH":
+                self.search_state()
+                self.state = "RETURN_NAVIGATION"
+
+            elif self.state == "RETURN_NAVIGATION":
+                self.return_navigation_state()
+                self.state = "DONE"
+
+            elif self.state == "DONE":
+                self.done_state()
+                self.state = "IDLE"
+
+            time.sleep(0.2)
+
+    # ======== ESTADOS ========
+
+    def navigation_state(self):
+        try:
+            print("[STATE] 🧭 NAVIGATION: desplazándose hacia la zona de fuego...")
+            subprocess.run(["python3", NAVIGATION_SCRIPT, str(self.last_rpi)], check=True)
+        except Exception as e:
+            print(f"[ERROR] ❌ Navegación: {e}")
+
+    def fire_fighting_state(self):
+        print("[STATE] 💦 FIRE_FIGHTING: Activando bomba y servo.")
+        try:
+            pump = subprocess.Popen(["python3", FIRE_FIGHT_SCRIPT])
+            servo = subprocess.Popen(["python3", SERVO_SCRIPT])
+            time.sleep(6)
+            pump.terminate()
+            servo.terminate()
+            print("[ACTION] ✅ Extinción completada.")
+        except Exception as e:
+            print(f"[ERROR] ❌ FIRE_FIGHTING: {e}")
+
+    def search_state(self):
+        try:
+            print("[STATE] 🔍 SEARCH: Activando servo-cámara y detección Edge Impulse...")
+            self.edge_confirmation = False
+
+            # Comando remoto para iniciar detección
+            command_payload = {"rpi_id": RPI_ID, "command": "start_edge_impulse"}
+            for c in self.mqtt_clients:
+                c.publish(TOPIC_EDGE_COMMAND, json.dumps(command_payload))
+
+            # Movimiento del servo-cámara
+            servo_process = subprocess.Popen(["python3", SERVO_CAMERA_SCRIPT])
+            start_time = time.time()
+            timeout = 25
+
+            while not self.edge_confirmation and (time.time() - start_time) < timeout:
+                time.sleep(0.3)
+
+            servo_process.terminate()
+
+            if self.edge_confirmation:
+                print("[SEARCH] ✅ Confirmación de fuego recibida.")
+            else:
+                print("[SEARCH] ⚠️ Timeout sin detección.")
+        except Exception as e:
+            print(f"[ERROR] ❌ SEARCH: {e}")
+
+    def return_navigation_state(self):
+        print("[STATE] 🏁 RETURN_NAVIGATION: regresando al origen.")
+        try:
+            subprocess.run(["python3", RETURN_NAVIGATION_SCRIPT, str(self.last_rpi)], check=True)
+        except Exception as e:
+            print(f"[ERROR] ❌ RETURN_NAVIGATION: {e}")
+
+    def done_state(self):
+        print("[STATE] 🔄 DONE: Reiniciando a IDLE.")
+        self.fire_detected = False
+        self.edge_confirmation = False
+        self.last_rpi = None
+
+
+if __name__ == "__main__":
+    FireFighterRobot().run()
