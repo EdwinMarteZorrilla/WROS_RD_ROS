@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+import time
+import subprocess
+import json
+import paho.mqtt.client as mqtt
+
+BROKERS = ["192.168.86.43", "192.168.149.1"]
+BROKER_PORT = 1883
+TOPIC_FIRE = "alerta/fuego"
+NAVIGATION_SCRIPT = "Navigation_Full_Nav2-C.py"
+FIRE_FIGHT_SCRIPT = "MQTT-TRANSMITTER-PUMP"
+SERVO_SCRIPT = "PUMP-SERVO"
+
+class FireFighterRobot:
+    def __init__(self):
+        self.state = "IDLE"
+        self.fire_detected = False
+        self.last_rpi = None
+        print("Robot iniciado. Estado: IDLE")
+        self.mqtt_clients = []
+        for ip in BROKERS:
+            client = mqtt.Client()
+            client.on_connect = self.on_connect
+            client.on_message = self.on_message
+            try:
+                client.connect(ip, BROKER_PORT, 60)
+                print(f"[MQTT] Conectado al broker {ip}:{BROKER_PORT}")
+            except Exception as e:
+                print(f"[MQTT] Error al conectar al broker {ip}: {e}")
+            client.loop_start()
+            self.mqtt_clients.append(client)
+
+    def on_connect(self, client, userdata, flags, rc):
+        client.subscribe(TOPIC_FIRE)
+        print(f"[MQTT] Subscrito a {TOPIC_FIRE}")
+
+    def on_message(self, client, userdata, msg):
+        try:
+            data = json.loads(msg.payload.decode())
+            label = data.get("label")
+            rpi_id = data.get("rpi_id")
+            if label in ["red_lid", "person_smoking"]:
+                print(f"[ALERTA] Señal recibida de {rpi_id}: {label}")
+                self.fire_detected = True
+                self.last_rpi = rpi_id
+        except Exception as e:
+            print("[MQTT] Error procesando mensaje:", e)
+
+    def run(self):
+        while True:
+            if self.state == "IDLE":
+                self.idle_state()
+            elif self.state == "NAVIGATION":
+                self.navigation_state()
+            elif self.state == "FIRE_FIGHTING":
+                self.fire_fighting_state()
+            elif self.state == "DONE":
+                self.done_state()
+            time.sleep(0.1)
+
+    def idle_state(self):
+        print("[STATE] IDLE esperando alerta...")
+        if self.fire_detected:
+            self.state = "NAVIGATION"
+
+    def navigation_state(self):
+        print(f"[STATE] NAVIGATION ejecutando navegación hacia {self.last_rpi}")
+
+        # Define goal coordinates basadas en el RPi que disparó la alerta
+        if self.last_rpi == "RPI_1":
+            goal = (4, 0)
+        elif self.last_rpi == "RPI_2":
+            goal = (2, 2)
+        else:
+            goal = (5, 5)
+
+        print(f"[NAVIGATION] Navegando hacia {goal}")
+
+        try:
+            # Ejecutar script de navegación
+            subprocess.run([
+                "python3", NAVIGATION_SCRIPT,
+                "--goal_row", str(goal[0]),
+                "--goal_col", str(goal[1])
+            ], check=True)
+
+            print("[NAVIGATION] Navegación completada, robot detenido.")
+            self.state = "FIRE_FIGHTING"
+
+        except Exception as e:
+            print(f"[ERROR] Error ejecutando navegación: {e}")
+            self.state = "DONE"
+
+    def fire_fighting_state(self):
+        print("[STATE] FIRE_FIGHTING: Activando bomba y servo simultáneamente...")
+        try:
+            pump_process = subprocess.Popen(["python3", FIRE_FIGHT_SCRIPT])
+            servo_process = subprocess.Popen(["python3", SERVO_SCRIPT])
+
+            print("[ACTION] Bomba y servo iniciados.")
+            time.sleep(5)  # Tiempo de operación
+
+            pump_process.terminate()
+            servo_process.terminate()
+            print("[ACTION] Operación de extinción completada.")
+            self.state = "DONE"
+
+        except Exception as e:
+            print(f"[ERROR] Error ejecutando bomba y servo: {e}")
+            self.state = "DONE"
+
+    def done_state(self):
+        print("[STATE] DONE: Misión completa, regresando a IDLE.")
+        self.fire_detected = False
+        self.last_rpi = None
+        self.state = "IDLE"
+
+
+if __name__ == "__main__":
+    robot = FireFighterRobot()
+    robot.run()

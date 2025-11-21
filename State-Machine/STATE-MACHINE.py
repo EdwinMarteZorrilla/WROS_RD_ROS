@@ -5,15 +5,13 @@ import json
 import paho.mqtt.client as mqtt
 import os
 
-BROKERS = ["192.168.149.171", "192.168.149.1"]
+BROKERS = ["192.168.86.43", "192.168.149.1"]
 BROKER_PORT = 1883
 TOPIC_FIRE = "alerta/fuego"
-NAVIGATION_SCRIPT = "NAVIGATION-STARTX"
-RETURN_NAVIGATION_SCRIPT = "NAVIGATION-FINAL"
+NAVIGATION_SCRIPT = "Navigation_Full_Nav2-C.py" 
 FIRE_FIGHT_SCRIPT = "MQTT-TRANSMITTER-PUMP"
 SERVO_SCRIPT = "PUMP-SERVO"
-SERVO_CAMERA_SCRIPT = "SERVO-CAMERA"
-POSE_FILE = "/tmp/robot_pose.json"
+
 
 class FireFighterRobot:
     def __init__(self):
@@ -43,7 +41,7 @@ class FireFighterRobot:
             data = json.loads(msg.payload.decode())
             label = data.get("label")
             rpi_id = data.get("rpi_id")
-            if label in ["fire","cigar","fireball"]:
+            if label in ["red_lid","person_smoking"]:
                 print(f"[ALERTA] Fuego detectado por {rpi_id}")
                 self.fire_detected = True
                 self.last_rpi = rpi_id
