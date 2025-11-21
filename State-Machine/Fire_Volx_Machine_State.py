@@ -11,12 +11,6 @@ RPI_ID = "FIREVOLX_ROBOT"
 NAVIGATION_SCRIPT = "Navigation_Full_Nav2-C.py"
 FIRE_FIGHT_SCRIPT = "MQTT-TRANSMITTER-PUMP"
 SERVO_SCRIPT = "PUMP-SERVO"
-SERVO_CAMERA_SCRIPT = "SERVO-CAMERA"
-
-# New scripts for the two added states
-LOCATE_FIRE_SCRIPT = "Center_Camera_Fix.py"
-TURN_FIRE_SCRIPT = "Get_Closer.py"
-
 
 class FireFighterRobot:
     def __init__(self):
